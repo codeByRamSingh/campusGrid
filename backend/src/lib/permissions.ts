@@ -1,0 +1,88 @@
+import { UserRole } from "@prisma/client";
+
+export type AppPermission =
+  | "ACADEMIC_READ"
+  | "ADMIN_MANAGE"
+  | "AUDIT_READ"
+  | "ADMISSIONS_APPROVE"
+  | "FINANCE_APPROVE"
+  | "FINANCE_READ"
+  | "FINANCE_WRITE"
+  | "HR_ATTENDANCE"
+  | "HR_READ"
+  | "HR_WRITE"
+  | "REPORTS_READ"
+  | "SETTINGS_MANAGE"
+  | "STUDENTS_READ"
+  | "STUDENTS_WRITE"
+  | "WORKFLOW_READ"
+  | "EXCEPTIONS_READ"
+  | "EXCEPTIONS_WRITE"
+  | "EXCEPTIONS_RESOLVE";
+
+const allPermissions: AppPermission[] = [
+  "ACADEMIC_READ",
+  "ADMIN_MANAGE",
+  "AUDIT_READ",
+  "ADMISSIONS_APPROVE",
+  "FINANCE_APPROVE",
+  "FINANCE_READ",
+  "FINANCE_WRITE",
+  "HR_ATTENDANCE",
+  "HR_READ",
+  "HR_WRITE",
+  "REPORTS_READ",
+  "SETTINGS_MANAGE",
+  "STUDENTS_READ",
+  "STUDENTS_WRITE",
+  "WORKFLOW_READ",
+  "EXCEPTIONS_READ",
+  "EXCEPTIONS_WRITE",
+  "EXCEPTIONS_RESOLVE",
+];
+
+export type StaffRoleName =
+  | "COLLEGE_ADMIN"
+  | "ADMISSIONS_OPERATOR"
+  | "CASHIER"
+  | "HR_OPERATOR"
+  | "ATTENDANCE_OPERATOR"
+  | "AUDITOR";
+
+const staffRolePermissions: Record<StaffRoleName, AppPermission[]> = {
+  COLLEGE_ADMIN: [
+    "ACADEMIC_READ",
+    "AUDIT_READ",
+    "ADMISSIONS_APPROVE",
+    "FINANCE_APPROVE",
+    "FINANCE_READ",
+    "FINANCE_WRITE",
+    "HR_ATTENDANCE",
+    "HR_READ",
+    "HR_WRITE",
+    "REPORTS_READ",
+    "STUDENTS_READ",
+    "STUDENTS_WRITE",
+    "WORKFLOW_READ",
+    "EXCEPTIONS_READ",
+    "EXCEPTIONS_WRITE",
+    "EXCEPTIONS_RESOLVE",
+  ],
+  ADMISSIONS_OPERATOR: ["ACADEMIC_READ", "STUDENTS_READ", "STUDENTS_WRITE", "WORKFLOW_READ", "EXCEPTIONS_READ", "EXCEPTIONS_WRITE"],
+  CASHIER: ["ACADEMIC_READ", "FINANCE_READ", "FINANCE_WRITE", "REPORTS_READ", "EXCEPTIONS_READ", "EXCEPTIONS_WRITE"],
+  HR_OPERATOR: ["ACADEMIC_READ", "HR_ATTENDANCE", "HR_READ", "HR_WRITE", "REPORTS_READ", "EXCEPTIONS_READ", "EXCEPTIONS_WRITE"],
+  ATTENDANCE_OPERATOR: ["ACADEMIC_READ", "HR_ATTENDANCE", "HR_READ"],
+  AUDITOR: ["ACADEMIC_READ", "AUDIT_READ", "FINANCE_READ", "HR_READ", "REPORTS_READ", "STUDENTS_READ", "WORKFLOW_READ", "EXCEPTIONS_READ"],
+};
+
+export function getPermissionsForUser(userRole: UserRole, staffRole?: string | null): AppPermission[] {
+  if (userRole === "SUPER_ADMIN") {
+    return allPermissions;
+  }
+
+  if (!staffRole || !(staffRole in staffRolePermissions)) {
+    return [];
+  }
+
+  return staffRolePermissions[staffRole as StaffRoleName] ?? [];
+}

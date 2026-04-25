@@ -1,0 +1,38 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  color-scheme: light;
+  --bg-soft: #f1f5f9;
+  --ink: #0f172a;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body,
+#root {
+  min-height: 100%;
+}
+
+body {
+  margin: 0;
+  background:
+    radial-gradient(1200px 580px at -10% -10%, #dbeafe 0%, transparent 45%),
+    radial-gradient(980px 540px at 110% -20%, #ccfbf1 0%, transparent 42%),
+    var(--bg-soft);
+  color: var(--ink);
+  font-family: "Space Grotesk", "Manrope", "Segoe UI", sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+button,
+input,
+select,
+textarea {
+  font: inherit;
+}
