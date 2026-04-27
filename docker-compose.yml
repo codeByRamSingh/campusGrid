@@ -1,19 +1,32 @@
-version: "3.9"
-
 services:
   db:
     image: postgres:16-alpine
     restart: unless-stopped
+    env_file: .env
     environment:
-      POSTGRES_DB: campusgrid
-      POSTGRES_USER: postgres
-      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: ${POSTGRES_DB:-campusgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
     volumes:
       - campusgrid_db_data:/var/lib/postgresql/data
     ports:
       - "5432:5432"
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U postgres -d campusgrid"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-campusgrid}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "6379:6379"
+    volumes:
+      - campusgrid_redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -22,30 +35,79 @@ services:
     build:
       context: ./backend
     restart: unless-stopped
+    env_file: .env
     environment:
-      DATABASE_URL: postgresql://postgres:postgres@db:5432/campusgrid?schema=public
-      JWT_SECRET: change-this-in-production
-      PORT: 4000
-      # Comma-separated list of allowed CORS origins
-      CORS_ORIGINS: http://localhost:80,http://localhost,http://localhost:5173
-      FRONTEND_URL: http://localhost
+      DATABASE_URL: ${DATABASE_URL:?DATABASE_URL must be set in .env}
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set in .env}
+      PORT: ${PORT:-4000}
+      CORS_ORIGINS: ${CORS_ORIGINS:-http://localhost:80,http://localhost,http://localhost:5173}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost}
+      SMTP_HOST: ${SMTP_HOST:-}
+      SMTP_PORT: ${SMTP_PORT:-587}
+      SMTP_USER: ${SMTP_USER:-}
+      SMTP_PASS: ${SMTP_PASS:-}
+      SMTP_FROM: ${SMTP_FROM:-noreply@campusgrid.local}
+      REDIS_URL: ${REDIS_URL:-redis://redis:6379}
+      FINANCE_API_RATE_LIMIT_MAX: ${FINANCE_API_RATE_LIMIT_MAX:-180}
+      PAYROLL_API_RATE_LIMIT_MAX: ${PAYROLL_API_RATE_LIMIT_MAX:-45}
+    volumes:
+      - campusgrid_storage:/app/storage
     depends_on:
       db:
         condition: service_healthy
+      redis:
+        condition: service_healthy
     ports:
       - "4000:4000"
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:4000/api/health/ready"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 30s
 
   frontend:
     build:
       context: ./frontend
       args:
-        # Vite bakes this URL into the bundle at build time
-        VITE_API_URL: http://localhost:4000/api
+        # Vite bakes this URL into the bundle at build time.
+        # Override via VITE_API_URL in your .env file for non-localhost deployments.
+        VITE_API_URL: ${VITE_API_URL:-http://localhost:4000/api}
     restart: unless-stopped
     depends_on:
       - backend
     ports:
       - "80:80"
 
+  # INF-07: Automated PostgreSQL backup via pg_dump
+  # Runs a daily dump at 02:00 UTC; keeps 30 days of backups.
+  # Backups are stored in the campusgrid_db_backups named volume.
+  # Override BACKUP_CRON_SCHEDULE to change frequency (cron syntax).
+  db-backup:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      POSTGRES_DB: ${POSTGRES_DB:-campusgrid}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      PGPASSWORD: ${POSTGRES_PASSWORD:?POSTGRES_PASSWORD must be set in .env}
+      POSTGRES_HOST: db
+      BACKUP_CRON_SCHEDULE: ${BACKUP_CRON_SCHEDULE:-0 2 * * *}
+      BACKUP_RETAIN_DAYS: ${BACKUP_RETAIN_DAYS:-30}
+    volumes:
+      - campusgrid_db_backups:/backups
+    depends_on:
+      db:
+        condition: service_healthy
+    entrypoint: >
+      sh -c "
+        echo 'Starting backup scheduler...';
+        echo \"$$BACKUP_CRON_SCHEDULE pg_dump -h $$POSTGRES_HOST -U $$POSTGRES_USER $$POSTGRES_DB | gzip > /backups/backup_\$\$(date +%Y%m%d_%H%M%S).sql.gz && find /backups -name '*.sql.gz' -mtime +$$BACKUP_RETAIN_DAYS -delete\" > /var/spool/cron/crontabs/root;
+        crond -f -d 8
+      "
+
 volumes:
   campusgrid_db_data:
+  campusgrid_redis_data:
+  campusgrid_storage:
+  campusgrid_db_backups:

@@ -1,3 +1,4 @@
+import cookieParser from "cookie-parser";
 import cors from "cors";
 import dotenv from "dotenv";
 import express from "express";
@@ -6,14 +7,20 @@ import morgan from "morgan";
 import { adminRouter } from "./routes/admin.routes.js";
 import { auditRouter } from "./routes/audit.routes.js";
 import { authRouter } from "./routes/auth.routes.js";
+import { documentsRouter } from "./routes/documents.routes.js";
 import { exceptionsRouter } from "./routes/exceptions.routes.js";
 import { financeRouter } from "./routes/finance.routes.js";
 import { healthRouter } from "./routes/health.routes.js";
 import { hrRouter } from "./routes/hr.routes.js";
+import { notificationsRouter } from "./routes/notifications.routes.js";
 import { reportsRouter } from "./routes/reports.routes.js";
 import { settingsRouter } from "./routes/settings.routes.js";
 import { studentRouter } from "./routes/student.routes.js";
 import { workflowRouter } from "./routes/workflow.routes.js";
+import { examRouter } from "./routes/exam.routes.js";
+import { hostelRouter } from "./routes/hostel.routes.js";
+import { libraryRouter } from "./routes/library.routes.js";
+import { transportRouter } from "./routes/transport.routes.js";
 
 dotenv.config();
 
@@ -46,6 +53,7 @@ app.use(
     credentials: true,
   })
 );
+app.use(cookieParser());
 app.use(express.json({ limit: "2mb" }));
 app.use(morgan("combined"));
 
@@ -60,6 +68,12 @@ app.use("/api", exceptionsRouter);
 app.use("/api", hrRouter);
 app.use("/api", reportsRouter);
 app.use("/api", settingsRouter);
+app.use("/api", documentsRouter);
+app.use("/api", notificationsRouter);
+app.use("/api", examRouter);
+app.use("/api", hostelRouter);
+app.use("/api", libraryRouter);
+app.use("/api", transportRouter);
 
 // 404 handler for unmatched API routes
 app.use("/api", (_req, res) => {

@@ -1,7 +1,11 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
 import {
   Bell,
+  BookOpen,
+  BedDouble,
   Building2,
+  Bus,
+  CalendarDays,
   Check,
   ChevronDown,
   Command,
@@ -30,6 +34,10 @@ const StudentsPage = lazy(() => import("./modules/saas/StudentsPage").then((modu
 const FinancePage = lazy(() => import("./modules/saas/FinancePage").then((module) => ({ default: module.FinancePage })));
 const HrPage = lazy(() => import("./modules/saas/HrPage").then((module) => ({ default: module.HrPage })));
 const ExceptionsPage = lazy(() => import("./modules/saas/ExceptionsPage").then((module) => ({ default: module.ExceptionsPage })));
+const ExamPage = lazy(() => import("./modules/saas/ExamPage").then((module) => ({ default: module.default })));
+const HostelPage = lazy(() => import("./modules/saas/HostelPage").then((module) => ({ default: module.default })));
+const LibraryPage = lazy(() => import("./modules/saas/LibraryPage").then((module) => ({ default: module.default })));
+const TransportPage = lazy(() => import("./modules/saas/TransportPage").then((module) => ({ default: module.default })));
 
 type UserSession = LoginResponse["user"];
 
@@ -65,6 +73,14 @@ type Student = {
   admissions?: Array<{ id: string; courseId: string; sessionId: string; createdAt?: string }>;
 };
 
+type StudentListResponse = {
+  data: Student[];
+  nextCursor?: string;
+  hasMore: boolean;
+};
+
+type StudentListPayload = Student[] | StudentListResponse;
+
 type Staff = {
   id: string;
   fullName: string;
@@ -72,18 +88,46 @@ type Staff = {
   mobile: string;
   collegeId: string;
   role?: string;
+  designation?: string;
+  staffType?: string;
+  employmentType?: string;
+  joiningDate?: string;
 };
+
+type SalaryConfig = {
+  id: string;
+  staffId: string;
+  basicSalary: number;
+  hra: number;
+  da: number;
+  otherAllowances: number;
+  bankAccountNumber: string | null;
+  bankName: string | null;
+  ifscCode: string | null;
+  pan: string | null;
+  pfUan: string | null;
+  paymentMode: string;
+};
+
+type SalaryConfigMap = Record<string, SalaryConfig>;
 
 type AttendanceRow = { id: string; date: string; status: string; staff: { fullName: string } };
 type LeaveRow = { id: string; fromDate: string; toDate: string; status: string; staff: { fullName: string }; reason: string };
-type PayrollRow = { id: string; month: number; year: number; amount: number; staff: { fullName: string } };
+type PayrollRow = { id: string; month: number; year: number; amount: number; status: string; paidAt?: string | null; staff: { id: string; fullName: string } };
 type ExpenseRow = { id: string; amount: number; category: string; spentOn: string; notes?: string };
+
+type PaginatedResponse<T> = {
+  data: T[];
+  nextCursor?: string;
+  hasMore: boolean;
+};
+
 type ReceivablesAging = {
   buckets: Array<{ label: string; count: number; amount: number }>;
   defaulters: Array<{ studentId: string; admissionNumber: number; admissionCode?: string; candidateName: string; due: number; daysOutstanding: number }>;
 };
 
-type NavKey = "dashboard" | "students" | "finance" | "hr" | "exceptions" | "admin" | "settings";
+type NavKey = "dashboard" | "students" | "finance" | "hr" | "exceptions" | "exam" | "hostel" | "library" | "transport" | "admin" | "settings";
 
 type ExceptionStatus = "NEW" | "TRIAGED" | "ASSIGNED" | "IN_PROGRESS" | "RESOLVED" | "CLOSED" | "REOPENED";
 
@@ -147,6 +191,23 @@ type NotificationItem = {
   subtitle: string;
   nav: NavKey;
   severity?: "info" | "warning" | "critical";
+  isRead: boolean;
+};
+
+type InAppNotificationLog = {
+  id: string;
+  subject: string;
+  body: string;
+  isRead: boolean;
+  metadata?: {
+    nav?: NavKey;
+    severity?: "info" | "warning" | "critical";
+  };
+};
+
+type InAppNotificationsResponse = {
+  unreadCount: number;
+  notifications: InAppNotificationLog[];
 };
 
 type DashboardSummary = {
@@ -227,12 +288,26 @@ type LoginAccount = {
   } | null;
 };
 
+type CustomRole = {
+  id: string;
+  collegeId: string;
+  name: string;
+  permissions: string[];
+  createdAt: string;
+  updatedAt: string;
+  _count?: { staff: number };
+};
+
 const navigation = [
   { key: "dashboard" as NavKey, label: "Dashboard", icon: LayoutDashboard },
   { key: "students" as NavKey, label: "Students", icon: Users },
   { key: "finance" as NavKey, label: "Finance", icon: Wallet },
   { key: "hr" as NavKey, label: "HR", icon: Receipt },
   { key: "exceptions" as NavKey, label: "Exceptions", icon: ShieldAlert },
+  { key: "exam" as NavKey, label: "Exams", icon: CalendarDays },
+  { key: "hostel" as NavKey, label: "Hostel", icon: BedDouble },
+  { key: "library" as NavKey, label: "Library", icon: BookOpen },
+  { key: "transport" as NavKey, label: "Transport", icon: Bus },
   { key: "admin" as NavKey, label: "Admin", icon: Building2 },
   { key: "settings" as NavKey, label: "Settings", icon: Settings },
 ];
@@ -253,13 +328,15 @@ export default function App() {
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
-  const [readNotificationIds, setReadNotificationIds] = useState<string[]>([]);
+  const [inAppNotifications, setInAppNotifications] = useState<InAppNotificationLog[]>([]);
+  const [unreadInAppCount, setUnreadInAppCount] = useState(0);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
 
   const [colleges, setColleges] = useState<College[]>([]);
   const [students, setStudents] = useState<Student[]>([]);
   const [staff, setStaff] = useState<Staff[]>([]);
+  const [salaryConfigs, setSalaryConfigs] = useState<SalaryConfigMap>({});
   const [attendanceRows, setAttendanceRows] = useState<AttendanceRow[]>([]);
   const [leaveRows, setLeaveRows] = useState<LeaveRow[]>([]);
   const [payrollRows, setPayrollRows] = useState<PayrollRow[]>([]);
@@ -274,6 +351,7 @@ export default function App() {
   });
   const [settingsSnapshot, setSettingsSnapshot] = useState<SettingsSnapshot | null>(null);
   const [loginAccounts, setLoginAccounts] = useState<LoginAccount[]>([]);
+  const [customRoles, setCustomRoles] = useState<CustomRole[]>([]);
   const [exceptions, setExceptions] = useState<ExceptionCaseRow[]>([]);
   const [exceptionMetrics, setExceptionMetrics] = useState<ExceptionMetrics | null>(null);
   const [dashboardFilters, setDashboardFilters] = useState<DashboardFilters>({
@@ -283,27 +361,12 @@ export default function App() {
   });
 
   useEffect(() => {
-    const token = localStorage.getItem("campusgrid_token");
+    // Token is in httpOnly cookie; just restore the user session from localStorage
     const userRaw = localStorage.getItem("campusgrid_user");
-    const readNotificationIdsRaw = localStorage.getItem("campusgrid_read_notifications");
-    if (token && userRaw) {
+    if (userRaw) {
       setUser(JSON.parse(userRaw) as UserSession);
     }
-    if (readNotificationIdsRaw) {
-      try {
-        const parsed = JSON.parse(readNotificationIdsRaw) as string[];
-        if (Array.isArray(parsed)) {
-          setReadNotificationIds(parsed);
-        }
-      } catch {
-        setReadNotificationIds([]);
-      }
-    }
   }, []);
-
-  useEffect(() => {
-    localStorage.setItem("campusgrid_read_notifications", JSON.stringify(readNotificationIds));
-  }, [readNotificationIds]);
 
   useEffect(() => {
     if (!user) {
@@ -316,8 +379,9 @@ export default function App() {
   const allPermissions = [
     "ACADEMIC_READ", "ADMIN_MANAGE", "AUDIT_READ", "ADMISSIONS_APPROVE",
     "FINANCE_APPROVE", "FINANCE_READ", "FINANCE_WRITE", "HR_ATTENDANCE",
-    "HR_READ", "HR_WRITE", "REPORTS_READ", "SETTINGS_MANAGE",
+    "HR_READ", "HR_WRITE", "PAYROLL_READ", "REPORTS_READ", "SETTINGS_MANAGE", "SETTINGS_COLLEGE",
     "STUDENTS_READ", "STUDENTS_WRITE", "WORKFLOW_READ", "EXCEPTIONS_READ", "EXCEPTIONS_WRITE", "EXCEPTIONS_RESOLVE",
+    "EXAM_READ", "EXAM_WRITE", "HOSTEL_READ", "HOSTEL_WRITE", "LIBRARY_READ", "LIBRARY_WRITE", "TRANSPORT_READ", "TRANSPORT_WRITE",
   ];
   // Super admins always have all permissions regardless of what the cached token carries
   const permissions = user?.role === "SUPER_ADMIN" ? allPermissions : (user?.permissions ?? []);
@@ -325,9 +389,14 @@ export default function App() {
   const canViewStudents = hasPermission(permissions, "STUDENTS_READ");
   const canViewFinance = hasPermission(permissions, "FINANCE_READ");
   const canViewHr = hasAnyPermission(permissions, ["HR_READ", "HR_ATTENDANCE"]);
+  const canViewPayroll = hasPermission(permissions, "PAYROLL_READ");
   const canViewExceptions = hasPermission(permissions, "EXCEPTIONS_READ");
   const canViewAdmin = user?.role === "SUPER_ADMIN";
   const canViewSettings = user?.role === "SUPER_ADMIN";
+  const canViewExam = hasPermission(permissions, "EXAM_READ");
+  const canViewHostel = hasPermission(permissions, "HOSTEL_READ");
+  const canViewLibrary = hasPermission(permissions, "LIBRARY_READ");
+  const canViewTransport = hasPermission(permissions, "TRANSPORT_READ");
 
   const accessibleNavigation = useMemo(
     () =>
@@ -337,11 +406,15 @@ export default function App() {
         if (item.key === "finance") return canViewFinance;
         if (item.key === "hr") return canViewHr;
         if (item.key === "exceptions") return canViewExceptions;
+        if (item.key === "exam") return canViewExam;
+        if (item.key === "hostel") return canViewHostel;
+        if (item.key === "library") return canViewLibrary;
+        if (item.key === "transport") return canViewTransport;
         if (item.key === "admin") return canViewAdmin;
         if (item.key === "settings") return canViewSettings;
         return false;
       }),
-    [canViewAdmin, canViewDashboard, canViewExceptions, canViewFinance, canViewHr, canViewSettings, canViewStudents]
+    [canViewAdmin, canViewDashboard, canViewExceptions, canViewExam, canViewFinance, canViewHostel, canViewHr, canViewLibrary, canViewSettings, canViewStudents, canViewTransport]
   );
 
   useEffect(() => {
@@ -378,6 +451,18 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
+  useEffect(() => {
+    function handleSessionExpired() {
+      localStorage.removeItem("campusgrid_user");
+      setUser(null);
+      setInAppNotifications([]);
+      setUnreadInAppCount(0);
+      toast.error("Session expired. Please login again.");
+    }
+    window.addEventListener("campusgrid:session-expired", handleSessionExpired);
+    return () => window.removeEventListener("campusgrid:session-expired", handleSessionExpired);
+  }, []);
+
   async function withBusy<T>(task: () => Promise<T>) {
     setBusy(true);
     try {
@@ -386,7 +471,6 @@ export default function App() {
       console.error(error);
       if (axios.isAxiosError(error)) {
         if (error.response?.status === 401) {
-          localStorage.removeItem("campusgrid_token");
           localStorage.removeItem("campusgrid_user");
           setUser(null);
           toast.error("Session expired. Please login again.");
@@ -417,6 +501,7 @@ export default function App() {
         structureRes,
         studentsRes,
         staffRes,
+        salaryConfigsRes,
         attendanceRes,
         leaveRes,
         payrollRes,
@@ -426,19 +511,22 @@ export default function App() {
         agingRes,
         dashboardSummaryRes,
         workflowRes,
+        notificationsRes,
         settingsRes,
         usersRes,
+        customRolesRes,
         exceptionsRes,
         exceptionMetricsRes,
       ] = await Promise.all([
         canReadAcademics ? api.get<College[]>("/admin/academic-structure") : Promise.resolve({ data: [] as College[] }),
-        canViewStudents ? api.get<Student[]>("/students") : Promise.resolve({ data: [] as Student[] }),
+        canViewStudents ? api.get<StudentListPayload>("/students") : Promise.resolve({ data: { data: [], hasMore: false } as StudentListResponse }),
         canViewHr ? api.get<Staff[]>("/hr/staff") : Promise.resolve({ data: [] as Staff[] }),
-        canViewHr ? api.get<AttendanceRow[]>("/hr/attendance") : Promise.resolve({ data: [] as AttendanceRow[] }),
-        canViewHr ? api.get<LeaveRow[]>("/hr/leave-requests") : Promise.resolve({ data: [] as LeaveRow[] }),
+        canViewPayroll ? api.get<SalaryConfigMap>("/hr/salary-configs") : Promise.resolve({ data: {} as SalaryConfigMap }),
+        canViewHr ? api.get<PaginatedResponse<AttendanceRow>>("/hr/attendance") : Promise.resolve({ data: { data: [], hasMore: false } as PaginatedResponse<AttendanceRow> }),
+        canViewHr ? api.get<PaginatedResponse<LeaveRow>>("/hr/leave-requests") : Promise.resolve({ data: { data: [], hasMore: false } as PaginatedResponse<LeaveRow> }),
         canViewHr ? api.get<PayrollRow[]>("/hr/payroll") : Promise.resolve({ data: [] as PayrollRow[] }),
         canViewFinance ? api.get<Ledger>("/finance/ledger", { params: { period: "monthly" } }) : Promise.resolve({ data: null as Ledger | null }),
-        canReadReports ? api.get<ExpenseRow[]>("/reports/expenses") : Promise.resolve({ data: [] as ExpenseRow[] }),
+        canReadReports ? api.get<PaginatedResponse<ExpenseRow>>("/reports/expenses") : Promise.resolve({ data: { data: [], hasMore: false } as PaginatedResponse<ExpenseRow> }),
         canReadReports
           ? api.get<Array<{ studentId: string; candidateName: string; due: number; fines: number }>>("/reports/dues-fines")
           : Promise.resolve({ data: [] as Array<{ studentId: string; candidateName: string; due: number; fines: number }> }),
@@ -461,32 +549,37 @@ export default function App() {
               },
             })
           : Promise.resolve({ data: { sections: [], summary: { approvals: 0, exceptions: 0, tasks: 0, total: 0 } } as WorkflowInbox }),
+        api.get<InAppNotificationsResponse>("/notifications/mine", { params: { limit: 30 } }),
         api.get<SettingsSnapshot>("/settings"),
         user?.role === "SUPER_ADMIN" ? api.get<LoginAccount[]>("/admin/users") : Promise.resolve({ data: [] as LoginAccount[] }),
+        hasPermission(permissions, "HR_WRITE") || user?.role === "SUPER_ADMIN" ? api.get<CustomRole[]>("/admin/custom-roles") : Promise.resolve({ data: [] as CustomRole[] }),
         canViewExceptions ? api.get<ExceptionCaseRow[]>("/exceptions") : Promise.resolve({ data: [] as ExceptionCaseRow[] }),
         canViewExceptions ? api.get<ExceptionMetrics>("/exceptions/metrics") : Promise.resolve({ data: null as ExceptionMetrics | null }),
       ]);
 
       setColleges(structureRes.data);
-      setStudents(studentsRes.data);
+      setStudents(Array.isArray(studentsRes.data) ? studentsRes.data : studentsRes.data.data);
       setStaff(staffRes.data);
-      setAttendanceRows(attendanceRes.data);
-      setLeaveRows(leaveRes.data);
+      setSalaryConfigs(salaryConfigsRes.data);
+      setAttendanceRows(attendanceRes.data.data);
+      setLeaveRows(leaveRes.data.data);
       setPayrollRows(payrollRes.data);
       setLedger(ledgerRes.data);
-      setExpenseReport(expenseRes.data);
+      setExpenseReport(expenseRes.data.data);
       setDuesReport(duesRes.data);
       setReceivablesAging(agingRes.data);
       setDashboardSummary(dashboardSummaryRes.data);
       setWorkflowInbox(workflowRes.data);
+      setInAppNotifications(notificationsRes.data.notifications ?? []);
+      setUnreadInAppCount(notificationsRes.data.unreadCount ?? 0);
       setSettingsSnapshot(settingsRes.data);
       setLoginAccounts(usersRes.data);
+      setCustomRoles(customRolesRes.data);
       setExceptions(exceptionsRes.data);
       setExceptionMetrics(exceptionMetricsRes.data);
     } catch (error) {
       console.error(error);
       if (axios.isAxiosError(error) && error.response?.status === 401) {
-        localStorage.removeItem("campusgrid_token");
         localStorage.removeItem("campusgrid_user");
         setUser(null);
         toast.error("Session expired. Please login again.");
@@ -522,16 +615,19 @@ export default function App() {
   }
 
   function handleLogin(data: LoginResponse) {
-    localStorage.setItem("campusgrid_token", data.token);
+    // Token and refresh token are set as httpOnly cookies by the server
     localStorage.setItem("campusgrid_user", JSON.stringify(data.user));
     setUser(data.user);
     toast.success("Welcome back");
   }
 
   function logout() {
-    localStorage.removeItem("campusgrid_token");
+    // Server clears httpOnly cookies; fire-and-forget
+    api.post("/auth/logout").catch(() => {});
     localStorage.removeItem("campusgrid_user");
     setUser(null);
+    setInAppNotifications([]);
+    setUnreadInAppCount(0);
   }
 
   const navBadges = useMemo(
@@ -548,44 +644,17 @@ export default function App() {
   const inboxCount = workflowInbox.summary.total;
 
   const notificationItems = useMemo<NotificationItem[]>(() => {
-    const workflowNotifications = workflowInbox.sections.flatMap((section) =>
-      section.items.slice(0, 5).map((item) => ({
-        id: `wf:${section.id}:${item.id}`,
-        title: item.title,
-        subtitle: item.subtitle,
-        nav: section.nav,
-        severity: (section.nav === "finance" ? "warning" : "info") as NotificationItem["severity"],
-      }))
-    );
+    return inAppNotifications.map((entry) => ({
+      id: entry.id,
+      title: entry.subject,
+      subtitle: entry.body,
+      nav: entry.metadata?.nav ?? "dashboard",
+      severity: entry.metadata?.severity ?? "info",
+      isRead: entry.isRead,
+    }));
+  }, [inAppNotifications]);
 
-    const systemNotifications: NotificationItem[] = [
-      receivablesAging.defaulters.length > 0
-        ? {
-            id: `sys:defaulters:${receivablesAging.defaulters.length}`,
-            title: `${receivablesAging.defaulters.length} fee defaulters need attention`,
-            subtitle: "Open finance receivables to review aging and follow-up.",
-            nav: "finance",
-            severity: "critical" as const,
-          }
-        : null,
-      leaveRows.filter((leave) => leave.status === "PENDING").length > 0
-        ? {
-            id: `sys:leave-pending:${leaveRows.filter((leave) => leave.status === "PENDING").length}`,
-            title: `${leaveRows.filter((leave) => leave.status === "PENDING").length} leave requests pending`,
-            subtitle: "Review and approve leave requests in HR workspace.",
-            nav: "hr",
-            severity: "warning" as const,
-          }
-        : null,
-    ].filter(Boolean) as NotificationItem[];
-
-    return [...systemNotifications, ...workflowNotifications].slice(0, 20);
-  }, [workflowInbox.sections, receivablesAging.defaulters.length, leaveRows]);
-
-  const unreadNotificationCount = useMemo(
-    () => notificationItems.filter((item) => !readNotificationIds.includes(item.id)).length,
-    [notificationItems, readNotificationIds]
-  );
+  const unreadNotificationCount = unreadInAppCount;
 
   const commandActions = useMemo(
     () => [
@@ -664,20 +733,37 @@ export default function App() {
     }
   }
 
-  function markNotificationRead(id: string) {
-    setReadNotificationIds((current) => (current.includes(id) ? current : [...current, id]));
+  async function markNotificationRead(id: string) {
+    const existing = inAppNotifications.find((item) => item.id === id);
+    if (!existing || existing.isRead) {
+      return;
+    }
+
+    try {
+      await api.patch(`/notifications/${id}/read`);
+      setInAppNotifications((current) => current.map((item) => (item.id === id ? { ...item, isRead: true } : item)));
+      setUnreadInAppCount((current) => Math.max(0, current - 1));
+    } catch {
+      toast.error("Unable to mark notification as read");
+    }
   }
 
-  function markAllNotificationsRead() {
-    setReadNotificationIds((current) => {
-      const ids = notificationItems.map((item) => item.id);
-      const merged = new Set([...current, ...ids]);
-      return Array.from(merged);
-    });
+  async function markAllNotificationsRead() {
+    if (unreadInAppCount === 0) {
+      return;
+    }
+
+    try {
+      await api.patch("/notifications/read-all");
+      setInAppNotifications((current) => current.map((item) => ({ ...item, isRead: true })));
+      setUnreadInAppCount(0);
+    } catch {
+      toast.error("Unable to mark all notifications as read");
+    }
   }
 
-  function openNotification(item: NotificationItem) {
-    markNotificationRead(item.id);
+  async function openNotification(item: NotificationItem) {
+    await markNotificationRead(item.id);
     setNotificationOpen(false);
     setActiveNav(item.nav);
   }
@@ -733,6 +819,14 @@ export default function App() {
     });
   }
 
+  async function confirmFeeDraft(draftId: string) {
+    await withBusy(async () => {
+      await api.post(`/finance/fee-collections/from-draft/${draftId}`);
+      await refreshAll();
+      toast.success("Draft confirmed and fee collected");
+    });
+  }
+
   async function raiseFeeException(payload: Record<string, unknown>) {
     return withBusy(async () => {
       const response = await api.post("/finance/fee-collections/exceptions", payload);
@@ -744,10 +838,42 @@ export default function App() {
 
   async function addStaff(payload: Record<string, unknown>) {
     await withBusy(async () => {
-      const response = await api.post<{ invite?: { inviteLink?: string } }>("/hr/staff", payload);
+      const response = await api.post<{ staff: { id: string }; invite?: { inviteLink?: string } }>("/hr/staff", payload);
+      const staffId = response.data.staff?.id;
+      // Persist salary/bank data if provided in onboarding wizard
+      if (staffId && (payload.monthlySalary || payload.bankAccountNumber)) {
+        try {
+          await api.put(`/hr/staff/${staffId}/salary`, {
+            basicSalary: payload.monthlySalary,
+            bankAccountNumber: payload.bankAccountNumber,
+            ifscCode: payload.ifscCode,
+            pan: payload.pan,
+            pfUan: payload.pfUan,
+            paymentMode: payload.paymentMode,
+          });
+        } catch {
+          // Non-fatal: staff was created; salary can be set separately
+        }
+      }
       await refreshAll();
       const inviteLink = response.data.invite?.inviteLink;
       toast.success(inviteLink ? `Staff invited. Setup link generated.` : "Staff member added");
+    });
+  }
+
+  async function saveSalaryConfig(staffId: string, config: Partial<SalaryConfig>) {
+    await withBusy(async () => {
+      await api.put(`/hr/staff/${staffId}/salary`, config);
+      await refreshAll();
+      toast.success("Salary configuration saved");
+    });
+  }
+
+  async function updatePayrollStatus(payrollId: string, status: "PROCESSED" | "PAID" | "REVERSED") {
+    await withBusy(async () => {
+      await api.patch(`/hr/payroll/${payrollId}/status`, { status });
+      await refreshAll();
+      toast.success(`Payroll marked as ${status.toLowerCase()}`);
     });
   }
 
@@ -903,6 +1029,30 @@ export default function App() {
       await api.delete(`/admin/subjects/${subjectId}`);
       await refreshAll();
       toast.success("Subject deleted");
+    });
+  }
+
+  async function addCustomRole(payload: Record<string, unknown>) {
+    await withBusy(async () => {
+      await api.post("/admin/custom-roles", payload);
+      await refreshAll();
+      toast.success("Custom role created");
+    });
+  }
+
+  async function updateCustomRole(roleId: string, payload: Record<string, unknown>) {
+    await withBusy(async () => {
+      await api.patch(`/admin/custom-roles/${roleId}`, payload);
+      await refreshAll();
+      toast.success("Custom role updated");
+    });
+  }
+
+  async function deleteCustomRole(roleId: string) {
+    await withBusy(async () => {
+      await api.delete(`/admin/custom-roles/${roleId}`);
+      await refreshAll();
+      toast.success("Custom role deleted");
     });
   }
 
@@ -1122,7 +1272,9 @@ export default function App() {
                           <button
                             type="button"
                             className="text-xs font-medium text-slate-600 hover:text-slate-900"
-                            onClick={markAllNotificationsRead}
+                            onClick={() => {
+                              void markAllNotificationsRead();
+                            }}
                           >
                             Mark all read
                           </button>
@@ -1131,7 +1283,7 @@ export default function App() {
                       <div className="max-h-80 space-y-2 overflow-y-auto pr-1">
                         {notificationItems.length === 0 && <p className="rounded-xl bg-slate-50 px-3 py-4 text-center text-sm text-slate-500">No notifications right now.</p>}
                         {notificationItems.map((item) => {
-                          const unread = !readNotificationIds.includes(item.id);
+                          const unread = !item.isRead;
                           const accent =
                             item.severity === "critical"
                               ? "bg-rose-500"
@@ -1143,7 +1295,9 @@ export default function App() {
                               key={item.id}
                               type="button"
                               className={`block w-full rounded-2xl border p-3 text-left hover:bg-slate-50 ${unread ? "border-slate-300 bg-white" : "border-slate-200 bg-slate-50/80"}`}
-                              onClick={() => openNotification(item)}
+                              onClick={() => {
+                                void openNotification(item);
+                              }}
                             >
                               <div className="flex items-start gap-3">
                                 <span className={`mt-1 inline-block h-2.5 w-2.5 rounded-full ${accent}`} />
@@ -1263,6 +1417,7 @@ export default function App() {
                       permissions={permissions}
                       onCollectFee={collectFee}
                       onSaveDraft={saveFeeDraft}
+                      onConfirmDraft={confirmFeeDraft}
                       onRaiseException={raiseFeeException}
                       onAddCredit={addMiscCredit}
                       onAddExpense={addExpense}
@@ -1274,6 +1429,8 @@ export default function App() {
                     <HrPage
                       colleges={colleges}
                       staff={staff}
+                      salaryConfigs={salaryConfigs}
+                      customRoles={customRoles}
                       attendanceRows={attendanceRows}
                       leaveRows={leaveRows}
                       payrollRows={payrollRows}
@@ -1282,6 +1439,8 @@ export default function App() {
                       onUpdateStaff={updateStaff}
                       onDeleteStaff={deleteStaff}
                       onUpdateLeaveStatus={updateLeaveStatus}
+                      onSaveSalaryConfig={saveSalaryConfig}
+                      onUpdatePayrollStatus={updatePayrollStatus}
                       loading={busy}
                       permissions={permissions}
                     />
@@ -1299,11 +1458,47 @@ export default function App() {
                     />
                   )}
 
+                  {activeNav === "exam" && (
+                    <ExamPage
+                      colleges={colleges}
+                      permissions={permissions}
+                      loading={busy}
+                    />
+                  )}
+
+                  {activeNav === "hostel" && (
+                    <HostelPage
+                      colleges={colleges}
+                      students={students}
+                      permissions={permissions}
+                      loading={busy}
+                    />
+                  )}
+
+                  {activeNav === "library" && (
+                    <LibraryPage
+                      colleges={colleges}
+                      students={students}
+                      permissions={permissions}
+                      loading={busy}
+                    />
+                  )}
+
+                  {activeNav === "transport" && (
+                    <TransportPage
+                      colleges={colleges}
+                      students={students}
+                      permissions={permissions}
+                      loading={busy}
+                    />
+                  )}
+
                   {(activeNav === "admin" || activeNav === "settings") && (
                     <EnterpriseAdminSettingsPanel
                       activeNav={activeNav}
                       colleges={colleges}
                       loginAccounts={loginAccounts}
+                      customRoles={customRoles}
                       settingsSnapshot={settingsSnapshot}
                       loading={busy}
                       onAddCollege={addCollege}
@@ -1318,6 +1513,9 @@ export default function App() {
                       onAddSubject={addSubject}
                       onUpdateSubject={updateSubject}
                       onDeleteSubject={deleteSubject}
+                      onAddCustomRole={addCustomRole}
+                      onUpdateCustomRole={updateCustomRole}
+                      onDeleteCustomRole={deleteCustomRole}
                       onUpdateSettings={updateSettings}
                     />
                   )}
@@ -1397,6 +1595,7 @@ function EnterpriseAdminSettingsPanel({
   activeNav,
   colleges,
   loginAccounts,
+  customRoles,
   settingsSnapshot,
   loading,
   onAddCollege,
@@ -1411,11 +1610,15 @@ function EnterpriseAdminSettingsPanel({
   onAddSubject,
   onUpdateSubject,
   onDeleteSubject,
+  onAddCustomRole,
+  onUpdateCustomRole,
+  onDeleteCustomRole,
   onUpdateSettings,
 }: {
   activeNav: NavKey;
   colleges: College[];
   loginAccounts: LoginAccount[];
+  customRoles: CustomRole[];
   settingsSnapshot: SettingsSnapshot | null;
   loading: boolean;
   onAddCollege: (payload: Record<string, unknown>) => Promise<void>;
@@ -1430,6 +1633,9 @@ function EnterpriseAdminSettingsPanel({
   onAddSubject: (payload: Record<string, unknown>) => Promise<void>;
   onUpdateSubject: (subjectId: string, payload: Record<string, unknown>) => Promise<void>;
   onDeleteSubject: (subjectId: string) => Promise<void>;
+  onAddCustomRole: (payload: Record<string, unknown>) => Promise<void>;
+  onUpdateCustomRole: (roleId: string, payload: Record<string, unknown>) => Promise<void>;
+  onDeleteCustomRole: (roleId: string) => Promise<void>;
   onUpdateSettings: (payload: {
     localization: { timezone: string; currency: string; dateFormat: string };
     security: { authStandard: string; staffDefaultPasswordPolicy: string };
@@ -1437,12 +1643,13 @@ function EnterpriseAdminSettingsPanel({
 }) {
   const isAdmin = activeNav === "admin";
 
-  type ModalType = "college" | "editCollege" | "course" | "editCourse" | "session" | "editSession" | "subject" | "editSubject" | null;
+  type ModalType = "college" | "editCollege" | "course" | "editCourse" | "session" | "editSession" | "subject" | "editSubject" | "customRole" | "editCustomRole" | null;
   const [modal, setModal] = useState<ModalType>(null);
   const [editingCollegeId, setEditingCollegeId] = useState("");
   const [editingCourseId, setEditingCourseId] = useState("");
   const [editingSessionId, setEditingSessionId] = useState("");
   const [editingSubjectId, setEditingSubjectId] = useState("");
+  const [editingCustomRoleId, setEditingCustomRoleId] = useState("");
   const [targetCollegeId, setTargetCollegeId] = useState("");
   const [targetCourseId, setTargetCourseId] = useState("");
   const [expandedColleges, setExpandedColleges] = useState<Set<string>>(new Set());
@@ -1468,6 +1675,9 @@ function EnterpriseAdminSettingsPanel({
 
   const [subjectName, setSubjectName] = useState("");
   const [subjectCode, setSubjectCode] = useState("");
+  const [customRoleCollegeId, setCustomRoleCollegeId] = useState("");
+  const [customRoleName, setCustomRoleName] = useState("");
+  const [customRolePermissions, setCustomRolePermissions] = useState<string[]>([]);
   const [timezone, setTimezone] = useState("Asia/Kolkata");
   const [currency, setCurrency] = useState("INR");
   const [dateFormat, setDateFormat] = useState("DD-MM-YYYY");
@@ -1480,10 +1690,12 @@ function EnterpriseAdminSettingsPanel({
     setEditingCourseId("");
     setEditingSessionId("");
     setEditingSubjectId("");
+    setEditingCustomRoleId("");
     setCollegeName(""); setCollegeCode(""); setCollegeUniversity(""); setCollegeAddress(""); setCollegeAdmissionPrefix(`MTET/AD${new Date().getFullYear()}`); setCollegeAdmissionNo("1");
     setCourseName(""); setCourseCode("");
     setSessionLabel(""); setSessionStart(String(new Date().getFullYear())); setSessionEnd(String(new Date().getFullYear() + 1)); setSessionRollPrefix(`MTET/R${new Date().getFullYear()}`); setSessionStartingRoll("1"); setSessionSeats(""); setSessionFee("");
     setSubjectName(""); setSubjectCode("");
+    setCustomRoleCollegeId(""); setCustomRoleName(""); setCustomRolePermissions([]);
   }
 
   function openEditCollegeModal(college: College) {
@@ -1521,6 +1733,14 @@ function EnterpriseAdminSettingsPanel({
     setSubjectName(subject.name);
     setSubjectCode(subject.code);
     setModal("editSubject");
+  }
+
+  function openEditCustomRoleModal(role: CustomRole) {
+    setEditingCustomRoleId(role.id);
+    setCustomRoleCollegeId(role.collegeId);
+    setCustomRoleName(role.name);
+    setCustomRolePermissions(role.permissions);
+    setModal("editCustomRole");
   }
 
   async function handleAddCollege(e: React.FormEvent) {
@@ -1583,9 +1803,33 @@ function EnterpriseAdminSettingsPanel({
     closeModal();
   }
 
+  async function handleAddCustomRole(e: React.FormEvent) {
+    e.preventDefault();
+    await onAddCustomRole({ collegeId: customRoleCollegeId, name: customRoleName, permissions: customRolePermissions });
+    closeModal();
+  }
+
+  async function handleEditCustomRole(e: React.FormEvent) {
+    e.preventDefault();
+    await onUpdateCustomRole(editingCustomRoleId, { name: customRoleName, permissions: customRolePermissions });
+    closeModal();
+  }
+
+  function toggleCustomRolePermission(permission: string) {
+    setCustomRolePermissions((current) =>
+      current.includes(permission) ? current.filter((entry) => entry !== permission) : [...current, permission]
+    );
+  }
+
   const totalCourses = colleges.reduce((sum, c) => sum + c.courses.length, 0);
   const totalSessions = colleges.reduce((sum, c) => sum + c.courses.reduce((s, cr) => s + cr.sessions.length, 0), 0);
   const totalSubjects = colleges.reduce((sum, c) => sum + c.courses.reduce((s, cr) => s + (cr.subjects?.length ?? 0), 0), 0);
+  const permissionCatalog = [
+    "ACADEMIC_READ", "ADMIN_MANAGE", "AUDIT_READ", "ADMISSIONS_APPROVE", "FINANCE_APPROVE", "FINANCE_READ", "FINANCE_WRITE",
+    "HR_ATTENDANCE", "HR_READ", "HR_WRITE", "PAYROLL_READ", "REPORTS_READ", "SETTINGS_MANAGE", "SETTINGS_COLLEGE",
+    "STUDENTS_READ", "STUDENTS_WRITE", "WORKFLOW_READ", "EXCEPTIONS_READ", "EXCEPTIONS_WRITE", "EXCEPTIONS_RESOLVE",
+    "EXAM_READ", "EXAM_WRITE", "HOSTEL_READ", "HOSTEL_WRITE", "LIBRARY_READ", "LIBRARY_WRITE", "TRANSPORT_READ", "TRANSPORT_WRITE",
+  ] as const;
 
   const settingsModules = [
     ["Security", settingsSnapshot?.security.authStandard ?? "JWT with role-based controls"],
@@ -1892,6 +2136,71 @@ function EnterpriseAdminSettingsPanel({
 
           <div className="overflow-hidden rounded-3xl bg-white shadow-sm ring-1 ring-slate-100">
             <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
+              <div>
+                <h2 className="text-sm font-semibold text-slate-800">Custom Roles</h2>
+                <p className="mt-1 text-xs text-slate-500">Build college-specific permission bundles for principals, registrars, or specialized operators.</p>
+              </div>
+              <button
+                type="button"
+                onClick={() => {
+                  closeModal();
+                  setCustomRoleCollegeId(colleges[0]?.id ?? "");
+                  setModal("customRole");
+                }}
+                className="inline-flex items-center gap-2 rounded-xl bg-slate-900 px-3 py-1.5 text-xs font-medium text-white hover:bg-slate-700"
+              >
+                <Plus className="h-3.5 w-3.5" /> Add Custom Role
+              </button>
+            </div>
+            {customRoles.length === 0 ? (
+              <div className="px-5 py-10 text-center text-sm text-slate-400">No custom roles defined yet.</div>
+            ) : (
+              <div className="grid gap-4 p-5 md:grid-cols-2">
+                {customRoles.map((role) => (
+                  <div key={role.id} className="rounded-2xl border border-slate-200 bg-slate-50/70 p-4">
+                    <div className="flex items-start justify-between gap-3">
+                      <div>
+                        <p className="text-sm font-semibold text-slate-900">{role.name}</p>
+                        <p className="mt-1 text-xs text-slate-500">{colleges.find((college) => college.id === role.collegeId)?.name ?? "Unknown college"}</p>
+                      </div>
+                      <span className="rounded-full bg-slate-100 px-2 py-1 text-[11px] font-medium text-slate-700">{role._count?.staff ?? 0} assigned</span>
+                    </div>
+                    <div className="mt-3 flex flex-wrap gap-1.5">
+                      {role.permissions.map((permission) => (
+                        <span key={permission} className="rounded-full bg-white px-2 py-1 text-[11px] font-medium text-slate-700 ring-1 ring-slate-200">
+                          {permission}
+                        </span>
+                      ))}
+                      {role.permissions.length === 0 && <span className="text-xs text-slate-400">No permissions granted</span>}
+                    </div>
+                    <div className="mt-4 flex gap-2">
+                      <button
+                        type="button"
+                        onClick={() => openEditCustomRoleModal(role)}
+                        className="rounded-xl border border-slate-200 px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-white"
+                      >
+                        Edit
+                      </button>
+                      <button
+                        type="button"
+                        onClick={() => {
+                          const confirmed = window.confirm(`Delete custom role ${role.name}? This will fail if it is still assigned.`);
+                          if (!confirmed) return;
+                          void onDeleteCustomRole(role.id);
+                        }}
+                        className="rounded-xl border border-rose-200 px-3 py-1.5 text-xs font-medium text-rose-700 hover:bg-rose-50"
+                      >
+                        Delete
+                      </button>
+                    </div>
+                  </div>
+                ))}
+              </div>
+            )}
+          </div>
+
+          <div className="overflow-hidden rounded-3xl bg-white shadow-sm ring-1 ring-slate-100">
+            <div className="flex items-center justify-between border-b border-slate-100 px-5 py-4">
               <h2 className="text-sm font-semibold text-slate-800">Login Accounts</h2>
               <span className="rounded-full bg-slate-100 px-2.5 py-1 text-xs font-medium text-slate-700">{loginAccounts.length} total</span>
             </div>
@@ -2169,6 +2478,63 @@ function EnterpriseAdminSettingsPanel({
                 <div className="mt-5 flex justify-end gap-2">
                   <button type="button" onClick={closeModal} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
                   <button type="submit" disabled={loading} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-60">{loading ? "Saving…" : (modal === "subject" ? "Add Subject" : "Save Changes")}</button>
+                </div>
+              </form>
+            )}
+
+            {(modal === "customRole" || modal === "editCustomRole") && (
+              <form onSubmit={(e) => { void (modal === "customRole" ? handleAddCustomRole(e) : handleEditCustomRole(e)); }}>
+                <h3 className="text-base font-semibold text-slate-900">{modal === "customRole" ? "Add Custom Role" : "Edit Custom Role"}</h3>
+                <p className="mt-1 text-xs text-slate-500">Create reusable permission bundles for college-specific operations teams.</p>
+                <div className="mt-4 space-y-3">
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-slate-700">College</label>
+                    <select
+                      required
+                      disabled={modal === "editCustomRole"}
+                      value={customRoleCollegeId}
+                      onChange={(e) => setCustomRoleCollegeId(e.target.value)}
+                      className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-300 disabled:opacity-70"
+                    >
+                      <option value="">Select a college</option>
+                      {colleges.map((college) => (
+                        <option key={college.id} value={college.id}>{college.name}</option>
+                      ))}
+                    </select>
+                  </div>
+                  <div>
+                    <label className="mb-1 block text-xs font-medium text-slate-700">Role Name</label>
+                    <input
+                      required
+                      value={customRoleName}
+                      onChange={(e) => setCustomRoleName(e.target.value)}
+                      placeholder="e.g. Principal, Registrar"
+                      className="w-full rounded-xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm outline-none focus:ring-2 focus:ring-slate-300"
+                    />
+                  </div>
+                  <div>
+                    <label className="mb-2 block text-xs font-medium text-slate-700">Permissions</label>
+                    <div className="grid max-h-64 grid-cols-2 gap-2 overflow-y-auto rounded-2xl border border-slate-200 bg-slate-50 p-3">
+                      {permissionCatalog.map((permission) => {
+                        const checked = customRolePermissions.includes(permission);
+                        return (
+                          <label key={permission} className={`flex cursor-pointer items-center gap-2 rounded-xl px-2 py-1.5 text-xs ${checked ? "bg-slate-900 text-white" : "bg-white text-slate-700 ring-1 ring-slate-200"}`}>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              onChange={() => toggleCustomRolePermission(permission)}
+                              className="rounded border-slate-300"
+                            />
+                            <span>{permission}</span>
+                          </label>
+                        );
+                      })}
+                    </div>
+                  </div>
+                </div>
+                <div className="mt-5 flex justify-end gap-2">
+                  <button type="button" onClick={closeModal} className="rounded-xl border border-slate-200 px-4 py-2 text-sm font-medium text-slate-600 hover:bg-slate-50">Cancel</button>
+                  <button type="submit" disabled={loading} className="rounded-xl bg-slate-900 px-4 py-2 text-sm font-medium text-white disabled:opacity-60">{loading ? "Saving…" : (modal === "customRole" ? "Create Role" : "Save Changes")}</button>
                 </div>
               </form>
             )}

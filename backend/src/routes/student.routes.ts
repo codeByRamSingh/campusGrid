@@ -1,5 +1,8 @@
 import { Router } from "express";
 import { body, param } from "express-validator";
+import fs from "fs";
+import multer from "multer";
+import path from "path";
 import { AdmissionWorkflowStatus, ExceptionModule, ExceptionSeverity, StudentStatus } from "@prisma/client";
 import { createExceptionCase } from "../lib/exceptions.js";
 import { prisma } from "../lib/prisma.js";
@@ -7,6 +10,33 @@ import { authenticate, canAccessCollege, getScopedCollegeId, requirePermission, 
 import { handleValidation } from "../middleware/validate.js";
 import { nextSequenceValue } from "../lib/sequence.js";
 import { writeAuditLog } from "../lib/audit.js";
+import { Prisma } from "@prisma/client";
+import { sendNotification } from "../lib/notify.js";
+
+const PHOTO_STORAGE_DIR = process.env.PHOTO_STORAGE_DIR ?? "/app/storage/student-photos";
+if (!fs.existsSync(PHOTO_STORAGE_DIR)) {
+  fs.mkdirSync(PHOTO_STORAGE_DIR, { recursive: true });
+}
+
+const photoStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, PHOTO_STORAGE_DIR),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    cb(null, `${Date.now()}_${Math.random().toString(36).slice(2)}${ext}`);
+  },
+});
+
+const photoUpload = multer({
+  storage: photoStorage,
+  limits: { fileSize: 5 * 1024 * 1024 }, // 5 MB
+  fileFilter: (_req, file, cb) => {
+    if (["image/jpeg", "image/png", "image/webp"].includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error("Only JPEG, PNG, and WebP images are allowed for photos"));
+    }
+  },
+});
 
 export const studentRouter = Router();
 
@@ -65,13 +95,36 @@ studentRouter.get("/students", requirePermission("STUDENTS_READ"), async (req, r
     return;
   }
 
+  const limit = Math.min(Number(req.query.limit || 100), 200);
+  const cursor = req.query.cursor as string | undefined;
+  const q = (req.query.q as string | undefined)?.trim();
+
   const students = await prisma.student.findMany({
-    where: collegeId ? { collegeId } : {},
+    where: {
+      ...(collegeId ? { collegeId } : {}),
+      isSoftDeleted: false,
+      ...(q
+        ? {
+            OR: [
+              { candidateName: { contains: q, mode: "insensitive" } },
+              { admissionCode: { contains: q, mode: "insensitive" } },
+              { email: { contains: q, mode: "insensitive" } },
+              { mobile: { contains: q, mode: "insensitive" } },
+            ],
+          }
+        : {}),
+    },
     include: { admissions: true },
     orderBy: { createdAt: "desc" },
-    take: 500,
+    take: limit + 1,
+    ...(cursor ? { cursor: { id: cursor }, skip: 1 } : {}),
   });
-  res.json(students);
+
+  const hasMore = students.length > limit;
+  const page = hasMore ? students.slice(0, limit) : students;
+  const nextCursor = hasMore ? page[page.length - 1].id : undefined;
+
+  res.json({ data: page, nextCursor, hasMore });
 });
 
 studentRouter.post(
@@ -117,6 +170,15 @@ studentRouter.post(
       return;
     }
 
+    // Guard against over-admission when a seat cap is set
+    if (session.seatCount > 0) {
+      const admitted = await prisma.admission.count({ where: { sessionId: session.id } });
+      if (admitted >= session.seatCount) {
+        res.status(409).json({ message: `Session is full. Seat capacity (${session.seatCount}) has been reached.` });
+        return;
+      }
+    }
+
     const admissionCounterKey = `college:${req.body.collegeId}`;
     const discountAmount = Number(req.body.discountAmount || 0);
     const scholarshipAmount = Number(req.body.scholarshipAmount || 0);
@@ -133,7 +195,7 @@ studentRouter.post(
     const { student, admission } = await prisma.$transaction(async (tx) => {
       const nextOffset = await nextSequenceValue(tx, "ADMISSION_NUMBER", admissionCounterKey, 0);
       const admissionNumber = college.startingAdmissionNumber + nextOffset;
-      const admissionCode = formatRunningCode(college.admissionNumberPrefix, admissionNumber);
+      const admissionCode = formatRunningCode(session.admissionNumberPrefix ?? college.admissionNumberPrefix, admissionNumber);
 
       const rollCounterKey = `session:${req.body.sessionId}`;
       const nextRollOffset = await nextSequenceValue(tx, "ROLL_NUMBER", rollCounterKey, 0);
@@ -197,6 +259,35 @@ studentRouter.post(
           },
         ],
       });
+
+      // TASK-FIN-01: Generate FeeDemandCycles for the student
+      if (totalPayable > 0) {
+        const durationYears = Math.max(1, (session.endYear || 0) - (session.startYear || 0));
+        const cycleCount = Math.max(2, durationYears * 2);
+        const perCycleAmount = Math.round((totalPayable / cycleCount) * 100) / 100;
+        let remaining = totalPayable;
+
+        const cycleData: { studentId: string; collegeId: string; cycleKey: string; label: string; dueDate: Date; amount: number }[] = [];
+        for (let i = 0; i < cycleCount; i++) {
+          const isLast = i === cycleCount - 1;
+          const amount = isLast ? Math.round(remaining * 100) / 100 : Math.min(remaining, perCycleAmount);
+          remaining = Math.max(0, Math.round((remaining - amount) * 100) / 100);
+          const dueDate = new Date((session.startYear ?? new Date().getFullYear()), 5 + i * 6, 15);
+          const cycleKey = `CYCLE_${i + 1}`;
+          const label = `Semester ${i + 1} Fee`;
+
+          cycleData.push({
+            studentId: createdStudent.id,
+            collegeId: req.body.collegeId,
+            cycleKey,
+            label,
+            dueDate,
+            amount,
+          });
+        }
+
+        await tx.feeDemandCycle.createMany({ data: cycleData });
+      }
 
       await tx.auditLog.create({
         data: {
@@ -397,11 +488,16 @@ studentRouter.get("/students/:studentId/workflow", requirePermission("STUDENTS_R
 studentRouter.patch(
   "/students/:studentId/workflow",
   requirePermission("ADMISSIONS_APPROVE"),
-  [param("studentId").notEmpty(), body("action").isIn(["VERIFY_DOCUMENTS", "VERIFY_FEES", "SEND_FOR_APPROVAL", "APPROVE", "REJECT", "REQUEST_CHANGES"])],
+  [
+    param("studentId").notEmpty(),
+    body("action").isIn(["VERIFY_DOCUMENTS", "VERIFY_FEES", "SEND_FOR_APPROVAL", "APPROVE", "REJECT", "REQUEST_CHANGES"]),
+    body("changeRequestItems").optional().isArray(),
+  ],
   handleValidation,
   async (req: AuthenticatedRequest, res) => {
     const action = req.body.action as "VERIFY_DOCUMENTS" | "VERIFY_FEES" | "SEND_FOR_APPROVAL" | "APPROVE" | "REJECT" | "REQUEST_CHANGES";
     const notes = req.body.notes as string | undefined;
+    const changeRequestItems = req.body.changeRequestItems as string[] | undefined;
 
     const student = await prisma.student.findUnique({
       where: { id: req.params.studentId },
@@ -460,6 +556,7 @@ studentRouter.patch(
       workflowUpdatedAt: Date;
       documentsVerifiedAt?: Date;
       feeVerifiedAt?: Date;
+      changeRequestItems?: Prisma.InputJsonValue | Prisma.NullTypes.JsonNull;
     } = {
       workflowUpdatedAt: now,
     };
@@ -469,6 +566,30 @@ studentRouter.patch(
     }
 
     if (action === "VERIFY_DOCUMENTS") {
+      // TASK-ADM-01: Validate all required doc types are present before marking verified
+      const course = await prisma.course.findUnique({
+        where: { id: currentAdmission.courseId },
+        select: { requiredDocTypes: true },
+      });
+
+      if (course && course.requiredDocTypes.length > 0) {
+        const uploadedDocs = await prisma.admissionDocument.findMany({
+          where: { admissionId: currentAdmission.id },
+          select: { docType: true },
+        });
+        const uploadedTypes = new Set(uploadedDocs.map((d) => d.docType));
+        const missing = course.requiredDocTypes.filter((t) => !uploadedTypes.has(t));
+
+        if (missing.length > 0) {
+          res.status(409).json({
+            code: "MISSING_REQUIRED_DOCUMENTS",
+            message: `Required documents missing: ${missing.join(", ")}`,
+            missing,
+          });
+          return;
+        }
+      }
+
       updateData.documentsVerifiedAt = now;
       updateData.workflowStatus = currentAdmission.feeVerifiedAt ? AdmissionWorkflowStatus.PENDING_APPROVAL : AdmissionWorkflowStatus.DOCUMENTS_VERIFIED;
     }
@@ -478,7 +599,15 @@ studentRouter.patch(
       updateData.workflowStatus = currentAdmission.documentsVerifiedAt ? AdmissionWorkflowStatus.PENDING_APPROVAL : AdmissionWorkflowStatus.FEE_VERIFIED;
     }
 
+    // ADM-02: Enforce both doc + fee verification before allowing SEND_FOR_APPROVAL
     if (action === "SEND_FOR_APPROVAL") {
+      if (!currentAdmission.documentsVerifiedAt || !currentAdmission.feeVerifiedAt) {
+        res.status(409).json({
+          code: "VERIFICATION_INCOMPLETE",
+          message: "Both document verification and fee verification must be completed before sending for approval.",
+        });
+        return;
+      }
       updateData.workflowStatus = AdmissionWorkflowStatus.PENDING_APPROVAL;
     }
 
@@ -486,12 +615,32 @@ studentRouter.patch(
       updateData.workflowStatus = AdmissionWorkflowStatus.APPROVED;
     }
 
+    // Backfill roll number if the student somehow got approved without one (schema allows null)
+    if (action === "APPROVE" && student.rollNumber == null) {
+      const sessionRecord = await prisma.session.findUnique({
+        where: { id: currentAdmission.sessionId },
+        select: { startingRollNumber: true, rollNumberPrefix: true },
+      });
+      if (sessionRecord) {
+        const rollCounterKey = `session:${currentAdmission.sessionId}`;
+        const nextRollOffset = await nextSequenceValue(prisma, "ROLL_NUMBER", rollCounterKey, 0);
+        const rollNumber = sessionRecord.startingRollNumber + nextRollOffset;
+        const rollCode = formatRunningCode(sessionRecord.rollNumberPrefix, rollNumber);
+        await prisma.student.update({
+          where: { id: student.id },
+          data: { rollNumber, rollCode },
+        });
+      }
+    }
+
     if (action === "REJECT") {
       updateData.workflowStatus = AdmissionWorkflowStatus.REJECTED;
     }
 
+    // ADM-03: Store structured changeRequestItems on REQUEST_CHANGES
     if (action === "REQUEST_CHANGES") {
       updateData.workflowStatus = AdmissionWorkflowStatus.CHANGES_REQUESTED;
+      updateData.changeRequestItems = changeRequestItems != null ? (changeRequestItems as Prisma.InputJsonValue) : Prisma.JsonNull;
     }
 
     const updatedAdmission = await prisma.$transaction(async (tx) => {
@@ -524,6 +673,22 @@ studentRouter.patch(
 
       return admission;
     });
+
+    // NOTIF-02: Send email notification on key admission transitions
+    if (["APPROVE", "REJECT", "REQUEST_CHANGES"].includes(action) && student.email) {
+      const statusLabel = updatedAdmission.workflowStatus.replace(/_/g, " ");
+      const actionLabel = action.replace(/_/g, " ");
+      await sendNotification({
+        collegeId: student.collegeId,
+        recipientEmail: student.email,
+        recipientId: student.id,
+        subject: `Admission ${actionLabel} — CampusGrid`,
+        body: `Dear ${student.candidateName},\n\nYour admission status has been updated to ${statusLabel}.\n\n${notes || ""}`,
+        metadata: { admissionId: currentAdmission.id, action },
+      }).catch(() => {
+        // Non-critical: notification failure should not fail the workflow response
+      });
+    }
 
     res.json({ workflow: serializeAdmissionWorkflow(updatedAdmission) });
   }
@@ -656,3 +821,47 @@ studentRouter.get("/students/:studentId/printables", requirePermission("STUDENTS
     ),
   });
 });
+
+// POST /students/:studentId/photo — upload/replace student passport photo
+studentRouter.post(
+  "/students/:studentId/photo",
+  authenticate,
+  requirePermission("STUDENTS_WRITE"),
+  [param("studentId").notEmpty()],
+  handleValidation,
+  photoUpload.single("photo"),
+  async (req: AuthenticatedRequest, res) => {
+    if (!req.file) {
+      res.status(400).json({ message: "No photo file uploaded" });
+      return;
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: req.params.studentId },
+      select: { id: true, collegeId: true, photoUrl: true },
+    });
+
+    if (!student) {
+      // Clean up orphan upload
+      fs.unlink(req.file.path, () => {});
+      res.status(404).json({ message: "Student not found" });
+      return;
+    }
+
+    if (!canAccessCollege(req, student.collegeId)) {
+      fs.unlink(req.file.path, () => {});
+      res.status(403).json({ message: "Cannot update another college's student" });
+      return;
+    }
+
+    const publicPath = `/storage/student-photos/${path.basename(req.file.path)}`;
+
+    const updated = await prisma.student.update({
+      where: { id: student.id },
+      data: { photoUrl: publicPath },
+      select: { id: true, photoUrl: true },
+    });
+
+    res.json({ photoUrl: updated.photoUrl });
+  }
+);

@@ -1,7 +1,7 @@
 import { Router } from "express";
 import { body } from "express-validator";
 import { writeAuditLog } from "../lib/audit.js";
-import { type AuthenticatedRequest, authenticate, requireRole } from "../middleware/auth.js";
+import { type AuthenticatedRequest, authenticate, requireRole, requirePermission } from "../middleware/auth.js";
 import { handleValidation } from "../middleware/validate.js";
 import { prisma } from "../lib/prisma.js";
 
@@ -93,6 +93,58 @@ settingsRouter.patch(
         staffDefaultPasswordPolicy: updated.staffDefaultPasswordPolicy,
         authStandard: updated.authStandard,
       },
+      localization: {
+        timezone: updated.timezone,
+        currency: updated.currency,
+        dateFormat: updated.dateFormat,
+      },
+      updatedAt: updated.updatedAt,
+    });
+  }
+);
+
+// PATCH /settings/college — COLLEGE_ADMIN can update localization settings only
+settingsRouter.patch(
+  "/settings/college",
+  authenticate,
+  requirePermission("SETTINGS_COLLEGE"),
+  [
+    body("localization.timezone").optional().isString().isLength({ min: 1, max: 100 }),
+    body("localization.currency").optional().isString().isLength({ min: 1, max: 20 }),
+    body("localization.dateFormat").optional().isString().isLength({ min: 1, max: 50 }),
+  ],
+  handleValidation,
+  async (req: AuthenticatedRequest, res) => {
+    const localization = (req.body.localization ?? {}) as {
+      timezone?: string;
+      currency?: string;
+      dateFormat?: string;
+    };
+
+    const updated = await prisma.appSetting.upsert({
+      where: { id: "default" },
+      update: {
+        ...(localization.timezone ? { timezone: localization.timezone } : {}),
+        ...(localization.currency ? { currency: localization.currency } : {}),
+        ...(localization.dateFormat ? { dateFormat: localization.dateFormat } : {}),
+      },
+      create: {
+        id: "default",
+        timezone: localization.timezone ?? "Asia/Kolkata",
+        currency: localization.currency ?? "INR",
+        dateFormat: localization.dateFormat ?? "DD-MM-YYYY",
+      },
+    });
+
+    await writeAuditLog(prisma, {
+      actorUserId: req.user?.id,
+      action: "SETTINGS_UPDATED",
+      entityType: "APP_SETTINGS",
+      entityId: updated.id,
+      metadata: { localization },
+    });
+
+    res.json({
       localization: {
         timezone: updated.timezone,
         currency: updated.currency,

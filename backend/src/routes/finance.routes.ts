@@ -11,10 +11,21 @@ import { handleValidation } from "../middleware/validate.js";
 import { nextSequenceValue } from "../lib/sequence.js";
 import { writeAuditLog } from "../lib/audit.js";
 import { buildLedgerSummary } from "../services/reporting.service.js";
+import { sendNotification } from "../lib/notify.js";
+import { createRateLimitMiddleware } from "../lib/rate-limit.js";
 
 export const financeRouter = Router();
 
 financeRouter.use(authenticate);
+financeRouter.use(
+  createRateLimitMiddleware({
+    scope: "finance-api",
+    windowMs: 60 * 1000,
+    max: Number(process.env.FINANCE_API_RATE_LIMIT_MAX ?? 180),
+    message: "Too many finance API requests. Please retry in a minute.",
+    key: (req) => req.user?.id ?? req.ip,
+  })
+);
 
 function optionalString(value: unknown) {
   return typeof value === "string" && value.trim().length > 0 ? value.trim() : null;
@@ -22,6 +33,11 @@ function optionalString(value: unknown) {
 
 const ATTACHMENTS_ROOT = path.resolve(process.cwd(), "storage", "expense-documents");
 const ATTACHMENT_TOKEN_TTL_SECONDS = 60 * 15;
+const _attachmentSecret = process.env.JWT_SECRET;
+if (!_attachmentSecret) {
+  throw new Error("FATAL: JWT_SECRET environment variable must be set");
+}
+const ATTACHMENT_HMAC_SECRET: string = _attachmentSecret;
 
 const RESTRICTED_FUND_RULES: Record<string, string[]> = {
   GRANTS: ["Academic", "Student Welfare", "Capital"],
@@ -67,8 +83,7 @@ function signAttachmentToken(payload: Record<string, unknown>) {
     exp: Math.floor(Date.now() / 1000) + ATTACHMENT_TOKEN_TTL_SECONDS,
   };
   const encoded = Buffer.from(JSON.stringify(data)).toString("base64url");
-  const secret = process.env.JWT_SECRET || "change-this-in-production";
-  const signature = crypto.createHmac("sha256", secret).update(encoded).digest("base64url");
+  const signature = crypto.createHmac("sha256", ATTACHMENT_HMAC_SECRET).update(encoded).digest("base64url");
   return `${encoded}.${signature}`;
 }
 
@@ -78,8 +93,7 @@ function verifyAttachmentToken(token: string) {
     return null;
   }
 
-  const secret = process.env.JWT_SECRET || "change-this-in-production";
-  const expected = crypto.createHmac("sha256", secret).update(encoded).digest("base64url");
+  const expected = crypto.createHmac("sha256", ATTACHMENT_HMAC_SECRET).update(encoded).digest("base64url");
   if (expected !== signature) {
     return null;
   }
@@ -939,6 +953,54 @@ financeRouter.post(
   }
 );
 
+// ─── Fee Reversal (FIN-05) ────────────────────────────────────────────────────
+
+financeRouter.post(
+  "/finance/payments/:paymentId/reverse",
+  requirePermission("FINANCE_APPROVE"),
+  [body("reason").notEmpty()],
+  handleValidation,
+  async (req: AuthenticatedRequest, res) => {
+    const payment = await prisma.payment.findUnique({
+      where: { id: req.params.paymentId },
+      include: { reversal: true },
+    });
+    if (!payment) { res.status(404).json({ message: "Payment not found" }); return; }
+    if (!canAccessCollege(req, payment.collegeId)) { res.status(403).json({ message: "Forbidden" }); return; }
+    if (payment.reversal) { res.status(409).json({ message: "Payment has already been reversed" }); return; }
+
+    const reversal = await prisma.$transaction(async (tx) => {
+      const rev = await tx.paymentReversal.create({
+        data: {
+          paymentId: payment.id,
+          collegeId: payment.collegeId,
+          reason: req.body.reason as string,
+          reversedBy: req.user?.id ?? null,
+        },
+      });
+
+      await tx.auditLog.create({
+        data: {
+          actorUserId: req.user?.id,
+          action: "PAYMENT_REVERSED",
+          entityType: "PAYMENT",
+          entityId: payment.id,
+          metadata: {
+            collegeId: payment.collegeId,
+            amount: payment.amount,
+            reason: req.body.reason,
+            receiptNumber: payment.receiptNumber,
+          },
+        },
+      });
+
+      return rev;
+    });
+
+    res.status(201).json(reversal);
+  }
+);
+
 financeRouter.post(
   "/finance/expenses",
   requirePermission("FINANCE_WRITE"),
@@ -1013,6 +1075,42 @@ financeRouter.post(
         sourceDocumentRef,
       },
     });
+
+    // TASK-FIN-05: Budget utilization alert at 80% and 100%
+    try {
+      const currentYear = new Date().getFullYear();
+      const fy = `${currentYear}-${String(currentYear + 1).slice(-2)}`;
+      const budget = await prisma.budget.findFirst({
+        where: { collegeId: req.body.collegeId, category: req.body.category, financialYear: fy },
+      });
+      if (budget && Number(budget.allocatedAmount) > 0) {
+        const totalSpent = await prisma.expense.aggregate({
+          _sum: { amount: true },
+          where: { collegeId: req.body.collegeId, category: req.body.category },
+        });
+        const spent = Number(totalSpent._sum.amount ?? 0);
+        const allocated = Number(budget.allocatedAmount);
+        const utilization = Math.round((spent / allocated) * 100);
+
+        if (utilization >= 100) {
+          await sendNotification({
+            subject: `Budget exceeded: ${req.body.category}`,
+            body: `The budget for ${req.body.category} has been fully utilized (${utilization}%). Allocated: ${allocated}, Spent: ${spent}.`,
+            collegeId: req.body.collegeId,
+            metadata: { category: req.body.category, utilization, allocated, spent },
+          });
+        } else if (utilization >= 80) {
+          await sendNotification({
+            subject: `Budget alert: ${req.body.category} at ${utilization}%`,
+            body: `${req.body.category} budget is ${utilization}% utilized. Allocated: ${allocated}, Spent: ${spent}.`,
+            collegeId: req.body.collegeId,
+            metadata: { category: req.body.category, utilization, allocated, spent },
+          });
+        }
+      }
+    } catch {
+      // Non-critical — don't fail expense creation if notification fails
+    }
 
     res.status(201).json(expense);
   }
@@ -1553,6 +1651,64 @@ financeRouter.patch(
   }
 );
 
+// ─── Vendor Payment History (FIN-09) ─────────────────────────────────────────
+
+financeRouter.get("/finance/vendors/:vendorId/payments", requirePermission("FINANCE_READ"), async (req: AuthenticatedRequest, res) => {
+  const vendor = await prisma.vendor.findUnique({ where: { id: req.params.vendorId }, select: { collegeId: true } });
+  if (!vendor) { res.status(404).json({ message: "Vendor not found" }); return; }
+  if (!canAccessCollege(req, vendor.collegeId)) { res.status(403).json({ message: "Forbidden" }); return; }
+
+  const payments = await prisma.vendorPayment.findMany({
+    where: { vendorId: req.params.vendorId },
+    orderBy: { paidAt: "desc" },
+    take: 100,
+  });
+  res.json(payments);
+});
+
+financeRouter.post(
+  "/finance/vendors/:vendorId/payments",
+  requirePermission("FINANCE_WRITE"),
+  [
+    body("amount").isFloat({ gt: 0 }),
+    body("description").notEmpty(),
+    body("paymentMode").optional().isString(),
+    body("referenceNumber").optional().isString(),
+    body("expenseId").optional().isString(),
+    body("paidAt").optional().isISO8601(),
+  ],
+  handleValidation,
+  async (req: AuthenticatedRequest, res) => {
+    const vendor = await prisma.vendor.findUnique({ where: { id: req.params.vendorId }, select: { collegeId: true } });
+    if (!vendor) { res.status(404).json({ message: "Vendor not found" }); return; }
+    if (!canAccessCollege(req, vendor.collegeId)) { res.status(403).json({ message: "Forbidden" }); return; }
+
+    const payment = await prisma.vendorPayment.create({
+      data: {
+        vendorId: req.params.vendorId,
+        collegeId: vendor.collegeId,
+        amount: Number(req.body.amount),
+        description: req.body.description,
+        paymentMode: optionalString(req.body.paymentMode) ?? "BANK_TRANSFER",
+        referenceNumber: optionalString(req.body.referenceNumber),
+        expenseId: optionalString(req.body.expenseId),
+        paidAt: req.body.paidAt ? new Date(req.body.paidAt as string) : new Date(),
+        recordedBy: req.user?.id ?? null,
+      },
+    });
+
+    await writeAuditLog(prisma, {
+      actorUserId: req.user?.id,
+      action: "VENDOR_PAYMENT_RECORDED",
+      entityType: "VENDOR_PAYMENT",
+      entityId: payment.id,
+      metadata: { vendorId: req.params.vendorId, amount: payment.amount },
+    });
+
+    res.status(201).json(payment);
+  }
+);
+
 // ─── Budget Management ────────────────────────────────────────────────────────
 
 financeRouter.get("/finance/budgets", requirePermission("FINANCE_READ"), async (req: AuthenticatedRequest, res) => {
@@ -1703,34 +1859,52 @@ financeRouter.post(
   async (req: AuthenticatedRequest, res) => {
     if (!canAccessCollege(req, req.body.collegeId as string)) { res.status(403).json({ message: "Forbidden" }); return; }
 
-    const lastEntry = await prisma.pettyCashEntry.findFirst({
-      where: { collegeId: req.body.collegeId },
-      orderBy: { createdAt: "desc" },
-    });
+    let entry;
+    try {
+      entry = await prisma.$transaction(async (tx) => {
+        // Compute current balance from all rows (race-condition-safe within Serializable tx)
+        const agg = await tx.$queryRaw<Array<{ balance: string }>>`
+          SELECT COALESCE(SUM(
+            CASE
+              WHEN "entryType" IN ('ALLOCATION', 'REIMBURSEMENT') THEN amount
+              ELSE -amount
+            END
+          ), 0)::text AS balance
+          FROM "PettyCashEntry"
+          WHERE "collegeId" = ${req.body.collegeId as string}
+        `;
 
-    const prevBalance = Number(lastEntry?.runningBalance ?? 0);
-    const amount = Number(req.body.amount);
-    const newBalance =
-      req.body.entryType === "ALLOCATION" || req.body.entryType === "REIMBURSEMENT"
-        ? prevBalance + amount
-        : prevBalance - amount;
+        const prevBalance = Number(agg[0]?.balance ?? 0);
+        const amount = Number(req.body.amount);
+        const newBalance =
+          req.body.entryType === "ALLOCATION" || req.body.entryType === "REIMBURSEMENT"
+            ? prevBalance + amount
+            : prevBalance - amount;
 
-    if (newBalance < 0) {
-      res.status(400).json({ message: "Insufficient petty cash balance" });
-      return;
+        if (newBalance < 0) {
+          throw Object.assign(new Error("Insufficient petty cash balance"), { status: 400 });
+        }
+
+        return tx.pettyCashEntry.create({
+          data: {
+            collegeId: req.body.collegeId,
+            entryType: req.body.entryType,
+            amount,
+            description: req.body.description,
+            reference: optionalString(req.body.reference),
+            runningBalance: newBalance,
+            recordedBy: req.user?.id ?? null,
+          },
+        });
+      }, { isolationLevel: "Serializable" });
+    } catch (err: unknown) {
+      const e = err as { status?: number; message?: string };
+      if (e?.status === 400) {
+        res.status(400).json({ message: e.message });
+        return;
+      }
+      throw err;
     }
-
-    const entry = await prisma.pettyCashEntry.create({
-      data: {
-        collegeId: req.body.collegeId,
-        entryType: req.body.entryType,
-        amount,
-        description: req.body.description,
-        reference: optionalString(req.body.reference),
-        runningBalance: newBalance,
-        recordedBy: req.user?.id ?? null,
-      },
-    });
 
     res.status(201).json(entry);
   }
@@ -2082,3 +2256,55 @@ financeRouter.get("/finance/expenses/audit-logs/export", requirePermission("REPO
   res.setHeader("Content-Disposition", `attachment; filename=\"expense-audit-${Date.now()}.csv\"`);
   res.send(csv);
 });
+
+// GET /finance/fee-demand-cycles — get persisted fee demand cycles
+financeRouter.get("/finance/fee-demand-cycles", requirePermission("FINANCE_READ"), async (req, res) => {
+  const studentId = req.query.studentId as string | undefined;
+  const scopedCollegeId = getScopedCollegeId(req, req.query.collegeId as string | undefined);
+  if (scopedCollegeId === "__FORBIDDEN__") {
+    res.status(403).json({ message: "Cannot access another college's data" });
+    return;
+  }
+
+  if (!studentId && !scopedCollegeId) {
+    res.status(400).json({ message: "Either studentId or collegeId query parameter is required" });
+    return;
+  }
+
+  const cycles = await prisma.feeDemandCycle.findMany({
+    where: {
+      ...(studentId ? { studentId } : {}),
+      ...(scopedCollegeId ? { collegeId: scopedCollegeId } : {}),
+    },
+    orderBy: [{ studentId: "asc" }, { dueDate: "asc" }],
+  });
+
+  res.json(cycles);
+});
+
+// PATCH /finance/fee-demand-cycles/:cycleId — update cycle status/paidAmount
+financeRouter.patch(
+  "/finance/fee-demand-cycles/:cycleId",
+  requirePermission("FINANCE_WRITE"),
+  async (req: AuthenticatedRequest, res) => {
+    const cycle = await prisma.feeDemandCycle.findUnique({ where: { id: req.params.cycleId } });
+    if (!cycle) {
+      res.status(404).json({ message: "Fee demand cycle not found" });
+      return;
+    }
+    if (!canAccessCollege(req, cycle.collegeId)) {
+      res.status(403).json({ message: "Cannot update another college's data" });
+      return;
+    }
+
+    const updated = await prisma.feeDemandCycle.update({
+      where: { id: req.params.cycleId },
+      data: {
+        ...(req.body.status ? { status: req.body.status } : {}),
+        ...(req.body.paidAmount !== undefined ? { paidAmount: Number(req.body.paidAmount) } : {}),
+      },
+    });
+
+    res.json(updated);
+  }
+);

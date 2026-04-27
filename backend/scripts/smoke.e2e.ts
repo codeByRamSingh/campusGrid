@@ -166,19 +166,31 @@ async function main() {
   await request(`/students/${studentId}/workflow`, {
     method: "PATCH",
     token,
-    body: { action: "APPROVE" },
+    body: { action: "VERIFY_DOCUMENTS" },
   });
 
   await request(`/students/${studentId}/workflow`, {
     method: "PATCH",
     token,
-    body: { action: "REJECT", notes: "Smoke reject validation" },
+    body: { action: "VERIFY_FEES" },
+  });
+
+  await request(`/students/${studentId}/workflow`, {
+    method: "PATCH",
+    token,
+    body: { action: "APPROVE" },
   });
 
   const workflow = await request<{ workflow: { status: string } }>(`/students/${studentId}/workflow`, { token });
-  if (workflow.workflow.status !== "REJECTED") {
-    throw new Error(`Workflow status assertion failed. Expected REJECTED, got ${workflow.workflow.status}`);
+  if (workflow.workflow.status !== "APPROVED") {
+    throw new Error(`Workflow status assertion failed. Expected APPROVED, got ${workflow.workflow.status}`);
   }
+
+  await requestExpectStatus(`/students/${studentId}/workflow`, 409, {
+    method: "PATCH",
+    token,
+    body: { action: "REJECT", notes: "Smoke reject validation" },
+  });
 
   await request("/finance/fee-collections", {
     method: "POST",

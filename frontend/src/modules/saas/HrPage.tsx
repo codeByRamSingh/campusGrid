@@ -18,14 +18,19 @@ import { AttendanceTrendChart } from "../../components/dashboard/AttendanceTrend
 import { PayrollExceptionTrendChart } from "../../components/dashboard/PayrollExceptionTrendChart";
 
 type College = { id: string; name: string };
-type Staff = { id: string; fullName: string; email: string; mobile: string; collegeId: string; role?: string };
+type Staff = { id: string; fullName: string; email: string; mobile: string; collegeId: string; role?: string; designation?: string; staffType?: string; employmentType?: string; joiningDate?: string; customRoleId?: string };
 type Attendance = { id: string; date: string; status: string; staff: { fullName: string } };
 type Leave = { id: string; fromDate: string; toDate: string; status: string; staff: { fullName: string } };
-type Payroll = { id: string; amount: number; month: number; year: number; staff: { id?: string; fullName: string } };
+type Payroll = { id: string; amount: number; month: number; year: number; status?: string; paidAt?: string | null; staff: { id?: string; fullName: string } };
+type SalaryConfig = { id: string; staffId: string; basicSalary: number; hra: number; da: number; otherAllowances: number; bankAccountNumber: string | null; bankName: string | null; ifscCode: string | null; pan: string | null; pfUan: string | null; paymentMode: string };
+type SalaryConfigMap = Record<string, SalaryConfig>;
+type CustomRole = { id: string; collegeId: string; name: string; permissions: string[]; createdAt: string; updatedAt: string };
 
 type Props = {
   colleges: College[];
   staff: Staff[];
+  salaryConfigs: SalaryConfigMap;
+  customRoles: CustomRole[];
   attendanceRows: Attendance[];
   leaveRows: Leave[];
   payrollRows: Payroll[];
@@ -36,6 +41,8 @@ type Props = {
   onUpdateStaff: (staffId: string, payload: Record<string, unknown>) => Promise<void>;
   onDeleteStaff: (staffId: string) => Promise<void>;
   onUpdateLeaveStatus: (leaveRequestId: string, status: "APPROVED" | "REJECTED") => Promise<void>;
+  onSaveSalaryConfig: (staffId: string, config: Partial<SalaryConfig>) => Promise<void>;
+  onUpdatePayrollStatus: (payrollId: string, status: "PROCESSED" | "PAID" | "REVERSED") => Promise<void>;
 };
 
 type WorkspaceKey = "people" | "onboarding" | "payroll" | "attendance" | "leave";
@@ -77,6 +84,7 @@ type OnboardingForm = {
   experience: string;
   functionalRole: string;
   department: string;
+  customRoleId: string;
 
   monthlySalary: string;
   bankAccountNumber: string;
@@ -158,6 +166,7 @@ function defaultOnboardingForm(colleges: College[]): OnboardingForm {
     experience: "",
     functionalRole: "",
     department: "",
+    customRoleId: "",
 
     monthlySalary: "",
     bankAccountNumber: "",
@@ -175,6 +184,8 @@ function defaultOnboardingForm(colleges: College[]): OnboardingForm {
 export function HrPage({
   colleges,
   staff,
+  salaryConfigs,
+  customRoles,
   attendanceRows,
   leaveRows,
   payrollRows,
@@ -185,11 +196,13 @@ export function HrPage({
   onUpdateStaff,
   onDeleteStaff,
   onUpdateLeaveStatus,
+  onSaveSalaryConfig,
+  onUpdatePayrollStatus,
 }: Props) {
   const canManageStaff = hasPermission(permissions, "HR_WRITE");
   const canManageAttendance = hasPermission(permissions, "HR_ATTENDANCE");
   const canManageLeave = hasPermission(permissions, "HR_WRITE");
-  const canViewPayroll = hasAnyPermission(permissions, ["HR_READ", "HR_WRITE"]);
+  const canViewPayroll = hasPermission(permissions, "PAYROLL_READ");
 
   const [activeWorkspace, setActiveWorkspace] = useState<WorkspaceKey>("people");
 
@@ -214,7 +227,6 @@ export function HrPage({
   const [deductionsByStaff, setDeductionsByStaff] = useState<Record<string, number>>({});
   const [manualAdjustmentsByStaff, setManualAdjustmentsByStaff] = useState<Record<string, number>>({});
   const [payrollHoldByStaff, setPayrollHoldByStaff] = useState<Record<string, boolean>>({});
-  const [paidByStaff, setPaidByStaff] = useState<Record<string, boolean>>({});
 
   const [showRunPayrollModal, setShowRunPayrollModal] = useState(false);
   const [includeAttendanceDeductions, setIncludeAttendanceDeductions] = useState(true);
@@ -264,57 +276,34 @@ export function HrPage({
     employmentStatus: "ACTIVE" as EmploymentStatus,
     salary: "",
     bankAccountNumber: "",
+    customRoleId: "",
   });
 
   const collegeNameById = useMemo(() => Object.fromEntries(colleges.map((college) => [college.id, college.name])), [colleges]);
 
-  const staffProfilesByEmail = useMemo(() => {
-    const map: Record<string, { staffType: StaffType; employmentStatus: EmploymentStatus; salary: number; bankAccountNumber: string; designation: string }> = {};
-    for (const draft of onboardingDrafts) {
-      map[draft.fullName.toLowerCase()] = {
-        staffType: draft.staffType,
-        employmentStatus: draft.employmentStatus,
-        salary: 0,
-        bankAccountNumber: "",
-        designation: draft.designation,
-      };
-    }
-
-    if (onboardingForm.email) {
-      map[onboardingForm.email.toLowerCase()] = {
-        staffType: onboardingForm.staffType,
-        employmentStatus: onboardingForm.employmentStatus,
-        salary: Number(onboardingForm.monthlySalary || 0),
-        bankAccountNumber: onboardingForm.bankAccountNumber,
-        designation: onboardingForm.designation,
-      };
-    }
-
-    return map;
-  }, [onboardingDrafts, onboardingForm]);
 
   const staffDirectoryRows = useMemo(() => {
     return staff.map((member) => {
       const inferredType = inferStaffType(member.role);
       const inferredStatus: EmploymentStatus = "ACTIVE";
       const inferredDesignation = inferDesignation(member.role);
-      const profile = staffProfilesByEmail[member.email.toLowerCase()];
       const overrides = staffProfileOverrides[member.id] ?? {};
-      const salary = Number(overrides.salary ?? profile?.salary ?? guessSalary(member.role));
+      const cfg = salaryConfigs[member.id];
+      const salary = Number(overrides.salary ?? cfg?.basicSalary ?? guessSalary(member.role));
 
       return {
         ...member,
         fullName: overrides.fullName ?? member.fullName,
         email: overrides.email ?? member.email,
         mobile: overrides.mobile ?? member.mobile,
-        staffType: overrides.staffType ?? profile?.staffType ?? inferredType,
-        employmentStatus: overrides.employmentStatus ?? profile?.employmentStatus ?? inferredStatus,
-        designation: overrides.designation ?? profile?.designation ?? inferredDesignation,
+        staffType: (overrides.staffType ?? member.staffType ?? inferredType) as StaffType,
+        employmentStatus: (overrides.employmentStatus ?? inferredStatus) as EmploymentStatus,
+        designation: overrides.designation ?? member.designation ?? inferredDesignation,
         salary,
-        bankAccountNumber: overrides.bankAccountNumber ?? profile?.bankAccountNumber ?? "",
+        bankAccountNumber: overrides.bankAccountNumber ?? cfg?.bankAccountNumber ?? "",
       };
     });
-  }, [staff, staffProfilesByEmail, staffProfileOverrides]);
+  }, [staff, salaryConfigs, staffProfileOverrides]);
 
   const filteredStaffDirectoryRows = useMemo(() => {
     const q = peopleQuery.trim().toLowerCase();
@@ -385,7 +374,7 @@ export function HrPage({
       const status = held
         ? "Held"
         : processedRecords.length > 0
-          ? paidByStaff[member.id]
+          ? processedRecords[0].status === "PAID"
             ? "Paid"
             : "Processed"
           : "Pending";
@@ -407,7 +396,7 @@ export function HrPage({
         },
       };
     });
-  }, [allowancesByStaff, deductionsByStaff, manualAdjustmentsByStaff, monthlyPayrollByStaff, paidByStaff, payrollFilteredStaff, payrollHoldByStaff, payrollMonth, payrollYear]);
+  }, [allowancesByStaff, deductionsByStaff, manualAdjustmentsByStaff, monthlyPayrollByStaff, payrollFilteredStaff, payrollHoldByStaff, payrollMonth, payrollYear]);
 
   const payrollKpis = useMemo(() => {
     const activeStaff = payrollFilteredStaff.filter((member) => member.employmentStatus === "ACTIVE").length;
@@ -590,20 +579,44 @@ export function HrPage({
         mobile: onboardingForm.mobile,
         role: onboardingForm.staffType === "TEACHING" ? "ADMISSIONS_OPERATOR" : "HR_OPERATOR",
         staffType: onboardingForm.staffType,
-        emergencyContact: onboardingForm.emergencyContact,
-        currentAddress: `${onboardingForm.currentAddress}, ${onboardingForm.city}, ${onboardingForm.district}, ${onboardingForm.state}, ${onboardingForm.pincode}, ${onboardingForm.country}`,
-        permanentAddress: onboardingForm.sameAsCurrentAddress
-          ? `${onboardingForm.currentAddress}, ${onboardingForm.city}, ${onboardingForm.district}, ${onboardingForm.state}, ${onboardingForm.pincode}, ${onboardingForm.country}`
-          : `${onboardingForm.permanentAddress}, ${onboardingForm.permanentCity}, ${onboardingForm.permanentDistrict}, ${onboardingForm.permanentState}, ${onboardingForm.permanentPincode}, ${onboardingForm.permanentCountry}`,
         designation: onboardingForm.designation,
         employmentType: onboardingForm.employmentType,
-        joiningDate: onboardingForm.joiningDate,
+        joiningDate: onboardingForm.joiningDate || null,
         employmentStatus: onboardingForm.employmentStatus,
+
+        // Personal profile (step 1)
+        dob: onboardingForm.dob || null,
+        gender: onboardingForm.gender,
+        emergencyContact: onboardingForm.emergencyContact || null,
+
+        // Address (step 2) — send granular fields
+        currentAddress: onboardingForm.currentAddress || null,
+        currentCity: onboardingForm.city || null,
+        currentDistrict: onboardingForm.district || null,
+        currentState: onboardingForm.state || null,
+        currentPincode: onboardingForm.pincode || null,
+        currentCountry: onboardingForm.country || null,
+        permanentAddress: onboardingForm.sameAsCurrentAddress ? onboardingForm.currentAddress || null : onboardingForm.permanentAddress || null,
+        permanentCity: onboardingForm.sameAsCurrentAddress ? onboardingForm.city || null : onboardingForm.permanentCity || null,
+        permanentDistrict: onboardingForm.sameAsCurrentAddress ? onboardingForm.district || null : onboardingForm.permanentDistrict || null,
+        permanentState: onboardingForm.sameAsCurrentAddress ? onboardingForm.state || null : onboardingForm.permanentState || null,
+        permanentPincode: onboardingForm.sameAsCurrentAddress ? onboardingForm.pincode || null : onboardingForm.permanentPincode || null,
+        permanentCountry: onboardingForm.sameAsCurrentAddress ? onboardingForm.country || null : onboardingForm.permanentCountry || null,
+
+        // Employment (step 3)
+        department: onboardingForm.department || null,
+        functionalRole: onboardingForm.functionalRole || null,
+        subjectSpecialization: onboardingForm.subjectSpecialization || null,
+        qualification: onboardingForm.qualification || null,
+        experience: onboardingForm.experience || null,
+        customRoleId: onboardingForm.customRoleId || null,
+
+        // Payroll (step 4)
         monthlySalary: Number(onboardingForm.monthlySalary || 0),
-        bankAccountNumber: onboardingForm.bankAccountNumber,
-        ifscCode: onboardingForm.ifscCode,
-        pan: onboardingForm.pan,
-        pfUan: onboardingForm.pfUan,
+        bankAccountNumber: onboardingForm.bankAccountNumber || null,
+        ifscCode: onboardingForm.ifscCode || null,
+        pan: onboardingForm.pan || null,
+        pfUan: onboardingForm.pfUan || null,
         paymentMode: onboardingForm.paymentMode,
       });
 
@@ -677,9 +690,13 @@ export function HrPage({
     setPayrollHoldByStaff((prev) => ({ ...prev, [staffId]: !prev[staffId] }));
   }
 
-  function markPayslipPaid(staffId: string) {
-    setPaidByStaff((prev) => ({ ...prev, [staffId]: true }));
-    toast.success("Payroll marked as paid");
+  async function markPayslipPaid(row: typeof payrollRowsComputed[number]) {
+    const record = row.processedRecords[0];
+    if (!record) {
+      toast.error("No payroll record found for this month. Process payroll first.");
+      return;
+    }
+    await onUpdatePayrollStatus(record.id, "PAID");
   }
 
   function generatePayslip(staffId: string) {
@@ -734,6 +751,7 @@ export function HrPage({
       employmentStatus: member.employmentStatus,
       salary: String(member.salary),
       bankAccountNumber: member.bankAccountNumber,
+      customRoleId: member.customRoleId ?? "",
     });
     setStaffProfileMode(mode);
   }
@@ -865,19 +883,30 @@ export function HrPage({
       mobile: staffEditForm.mobile,
       role: nextRole,
       isActive,
+      designation: staffEditForm.designation,
+      staffType: staffEditForm.staffType,
+      employmentType: staffEditForm.staffType === "TEACHING" ? "FULL_TIME" : "FULL_TIME",
+      customRoleId: staffEditForm.customRoleId || null,
     });
 
+    // Persist salary/bank to the dedicated salary config endpoint
+    await onSaveSalaryConfig(selectedStaffProfile.id, {
+      basicSalary: Number(staffEditForm.salary || 0),
+      bankAccountNumber: staffEditForm.bankAccountNumber || null,
+    });
+
+    // Keep cosmetic overrides for designation/staffType/employmentStatus in local state
+    // (refreshAll will update salary/bank from the API)
     setStaffProfileOverrides((prev) => ({
       ...prev,
       [selectedStaffProfile.id]: {
+        ...prev[selectedStaffProfile.id],
         fullName: staffEditForm.fullName,
         email: staffEditForm.email,
         mobile: staffEditForm.mobile,
         designation: staffEditForm.designation,
         staffType: staffEditForm.staffType,
         employmentStatus: staffEditForm.employmentStatus,
-        salary: Number(staffEditForm.salary || 0),
-        bankAccountNumber: staffEditForm.bankAccountNumber,
       },
     }));
     setStaffProfileMode("view");
@@ -1087,6 +1116,7 @@ export function HrPage({
                       <label className="text-sm text-slate-600">Designation<input value={staffEditForm.designation} onChange={(event) => setStaffEditForm((prev) => ({ ...prev, designation: event.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm" /></label>
                       <label className="text-sm text-slate-600">Staff Type<select value={staffEditForm.staffType} onChange={(event) => setStaffEditForm((prev) => ({ ...prev, staffType: event.target.value as StaffType }))} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option value="TEACHING">Teaching</option><option value="EXECUTIVE">Executive</option></select></label>
                       <label className="text-sm text-slate-600">Employment Status<select value={staffEditForm.employmentStatus} onChange={(event) => setStaffEditForm((prev) => ({ ...prev, employmentStatus: event.target.value as EmploymentStatus }))} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option value="ACTIVE">Active</option><option value="PROBATION">Probation</option><option value="INACTIVE">Inactive</option></select></label>
+                      <label className="text-sm text-slate-600">Custom Role (Optional)<select value={staffEditForm.customRoleId} onChange={(event) => setStaffEditForm((prev) => ({ ...prev, customRoleId: event.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"><option value="">None</option>{customRoles.map((role) => (<option key={role.id} value={role.id}>{role.name}</option>))}</select></label>
                       <label className="text-sm text-slate-600">Salary<input type="number" value={staffEditForm.salary} onChange={(event) => setStaffEditForm((prev) => ({ ...prev, salary: event.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm" /></label>
                       <label className="text-sm text-slate-600">Bank Account Number<input value={staffEditForm.bankAccountNumber} onChange={(event) => setStaffEditForm((prev) => ({ ...prev, bankAccountNumber: event.target.value }))} className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm" /></label>
                     </div>
@@ -1223,6 +1253,15 @@ export function HrPage({
                           { label: "Active", value: "ACTIVE" },
                           { label: "Probation", value: "PROBATION" },
                           { label: "Inactive", value: "INACTIVE" },
+                        ]}
+                      />
+                      <SelectField
+                        label="Custom Role (Optional)"
+                        value={onboardingForm.customRoleId}
+                        onChange={(value) => updateOnboarding({ customRoleId: value })}
+                        options={[
+                          { label: "None", value: "" },
+                          ...customRoles.map((role) => ({ label: role.name, value: role.id })),
                         ]}
                       />
                     </div>
@@ -1492,7 +1531,7 @@ export function HrPage({
                         <button type="button" onClick={() => generatePayslip(selectedPayrollRow.member.id)} className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700">Generate Payslip</button>
                         <button type="button" onClick={() => downloadPayslipPdf(selectedPayrollRow.member.id)} className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700">Download Payslip PDF</button>
                         <button type="button" onClick={() => emailPayslip(selectedPayrollRow.member.id)} className="rounded-xl bg-slate-100 px-3 py-2 text-xs font-medium text-slate-700">Email Payslip</button>
-                        <button type="button" onClick={() => markPayslipPaid(selectedPayrollRow.member.id)} className="rounded-xl bg-emerald-600 px-3 py-2 text-xs font-medium text-white">Mark as Paid</button>
+                        <button type="button" onClick={() => void markPayslipPaid(selectedPayrollRow)} className="rounded-xl bg-emerald-600 px-3 py-2 text-xs font-medium text-white">Mark as Paid</button>
                       </div>
                     </div>
                   )}

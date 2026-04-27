@@ -127,11 +127,45 @@ Password: Admin@123
 docker compose down
 ```
 
+### Non-Localhost Deployments (Production)
+
+By default, the frontend API URL is set to `http://localhost:4000/api`. For production deployments to a different host, set the `VITE_API_URL` environment variable **before building**:
+
+```bash
+# Update .env with your production API URL
+export VITE_API_URL=https://api.example.com/api
+
+# Rebuild and start containers
+docker compose up --build -d
+```
+
+The `VITE_API_URL` value is **baked into the frontend bundle at build time**, so you must rebuild the image whenever you change it.
+
+Alternatively, update your `.env` file:
+```env
+VITE_API_URL=https://api.example.com/api
+```
+
+Then rebuild:
+```bash
+docker compose down
+docker compose up --build -d
+```
+
 ### Full Reset
 ```bash
 docker compose down -v
 docker compose up --build -d
 ```
+
+### Runtime Certification (One Command)
+Runs Docker build/up, smoke E2E, and cross-module API probes with a PASS/FAIL report.
+
+```bash
+./scripts/runtime-certify.sh
+```
+
+The command exits with non-zero status when any check fails, so it is CI-safe.
 
 ## Local API Quick Checks
 
@@ -222,6 +256,7 @@ and apply the required database migration before production rollout.
 - ✅ Database: PostgreSQL accepting connections
 - ✅ TypeScript: 0 compilation errors
 - ✅ Build: 2908 modules transformed
+- ✅ Runtime certification: `./scripts/runtime-certify.sh`
 
 ## Positioning
 

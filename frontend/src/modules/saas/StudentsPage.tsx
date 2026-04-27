@@ -921,7 +921,7 @@ export function StudentsPage({ colleges, students, loading, permissions, onCreat
     workflowStatus === "PENDING_APPROVAL"
       ? { key: "REJECT" as const, label: "Reject", className: "bg-rose-600 text-white" }
       : null,
-    ["PENDING_APPROVAL", "REJECTED"].includes(workflowStatus)
+    ["PENDING_APPROVAL"].includes(workflowStatus)
       ? { key: "REQUEST_CHANGES" as const, label: "Request Changes", className: "bg-slate-100 text-slate-700" }
       : null,
   ].filter(Boolean) as Array<{

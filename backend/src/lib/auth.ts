@@ -1,7 +1,12 @@
 import bcrypt from "bcryptjs";
+import crypto from "crypto";
 import jwt from "jsonwebtoken";
 
-const jwtSecret = process.env.JWT_SECRET || "change-this-in-production";
+const _envSecret = process.env.JWT_SECRET;
+if (!_envSecret) {
+  throw new Error("FATAL: JWT_SECRET environment variable must be set");
+}
+const jwtSecret: string = _envSecret;
 
 export type TokenPayload = {
   sub: string;
@@ -22,3 +27,18 @@ export function signToken(payload: TokenPayload): string {
 export function verifyToken(token: string): TokenPayload {
   return jwt.verify(token, jwtSecret) as TokenPayload;
 }
+
+/** Generate a cryptographically-random opaque refresh token (returns raw token + SHA-256 hash to store). */
+export function generateRefreshToken(): { raw: string; hash: string } {
+  const raw = crypto.randomBytes(40).toString("hex");
+  const hash = crypto.createHash("sha256").update(raw).digest("hex");
+  return { raw, hash };
+}
+
+/** Hash an incoming refresh token for DB lookup. */
+export function hashRefreshToken(raw: string): string {
+  return crypto.createHash("sha256").update(raw).digest("hex");
+}
+
+/** Refresh token TTL: 30 days. */
+export const REFRESH_TOKEN_TTL_MS = 30 * 24 * 60 * 60 * 1000;

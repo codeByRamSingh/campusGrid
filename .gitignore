@@ -1,8 +1,23 @@
 node_modules
 npm-debug.log*
+
+# Local environment — never commit real secrets
 .env
+# .env.example is intentionally committed (no real secrets)
+
+# Build artefacts
 backend/node_modules
 backend/dist
 frontend/node_modules
 frontend/dist
+
+# Database migrations (keep example; generated migrations are environment-specific)
 backend/prisma/migrations
+
+# Uploaded / generated files
+backend/storage/
+
+# OS / editor
+.DS_Store
+*.swp
+*.swo

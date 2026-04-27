@@ -243,6 +243,7 @@ type Props = {
   permissions: string[];
   onCollectFee: (payload: Record<string, unknown>) => Promise<{ receiptNumber?: string } | undefined>;
   onSaveDraft: (payload: Record<string, unknown>) => Promise<{ id?: string } | undefined>;
+  onConfirmDraft: (draftId: string) => Promise<void>;
   onRaiseException: (payload: Record<string, unknown>) => Promise<{ id?: string } | undefined>;
   onAddCredit: (payload: Record<string, unknown>) => Promise<void>;
   onAddExpense: (payload: Record<string, unknown>) => Promise<void>;
@@ -265,6 +266,7 @@ export function FinancePage({
   permissions,
   onCollectFee,
   onSaveDraft,
+  onConfirmDraft,
   onRaiseException,
   onAddCredit,
   onAddExpense,
@@ -1147,36 +1149,52 @@ export function FinancePage({
                         </tr>
                       ))}
 
-                      {!studentLedgerLoading && !studentLedgerError && ledgerTab === "adjustments" && [
-                        ...(studentLedger?.drafts ?? []).map((row) => ({
-                          id: row.id,
-                          date: row.createdAt,
-                          doc: row.id,
-                          type: "Draft",
-                          debit: Number(row.amount),
-                          credit: 0,
-                          balance: Number(row.amount),
-                        })),
-                        ...(studentLedger?.exceptions ?? []).map((row) => ({
-                          id: row.id,
-                          date: row.createdAt,
-                          doc: row.id,
-                          type: `Exception ${row.status}`,
-                          debit: Number(row.requestedAmount),
-                          credit: 0,
-                          balance: Number(row.remainingBalance),
-                        })),
-                      ].map((row) => (
-                        <tr key={row.id}>
-                          <td className="px-3 py-2">{new Date(row.date).toLocaleDateString()}</td>
-                          <td className="px-3 py-2">{row.doc}</td>
-                          <td className="px-3 py-2">{row.type}</td>
-                          <td className="px-3 py-2">{formatCurrency(row.debit)}</td>
-                          <td className="px-3 py-2">{formatCurrency(row.credit)}</td>
-                          <td className="px-3 py-2">{formatCurrency(row.balance)}</td>
-                          <td className="px-3 py-2">--</td>
-                        </tr>
-                      ))}
+                      {!studentLedgerLoading && !studentLedgerError && ledgerTab === "adjustments" && (() => {
+                        type AdjRow = { id: string; date: string; doc: string; type: string; debit: number; credit: number; balance: number; draftId?: string; draftStatus?: string };
+                        const rows: AdjRow[] = [
+                          ...(studentLedger?.drafts ?? []).map((row) => ({
+                            id: row.id,
+                            date: row.createdAt,
+                            doc: row.id,
+                            type: "Draft" as const,
+                            draftId: row.id,
+                            draftStatus: row.status,
+                            debit: Number(row.amount),
+                            credit: 0,
+                            balance: Number(row.amount),
+                          })),
+                          ...(studentLedger?.exceptions ?? []).map((row) => ({
+                            id: row.id,
+                            date: row.createdAt,
+                            doc: row.id,
+                            type: `Exception ${row.status}`,
+                            debit: Number(row.requestedAmount),
+                            credit: 0,
+                            balance: Number(row.remainingBalance),
+                          })),
+                        ];
+                        return rows.map((row) => (
+                          <tr key={row.id}>
+                            <td className="px-3 py-2">{new Date(row.date).toLocaleDateString()}</td>
+                            <td className="px-3 py-2">{row.doc}</td>
+                            <td className="px-3 py-2">{row.type}</td>
+                            <td className="px-3 py-2">{formatCurrency(row.debit)}</td>
+                            <td className="px-3 py-2">{formatCurrency(row.credit)}</td>
+                            <td className="px-3 py-2">{formatCurrency(row.balance)}</td>
+                            <td className="px-3 py-2">
+                              {row.draftId && row.draftStatus !== "POSTED" && (
+                                <button
+                                  type="button"
+                                  className="rounded-lg bg-emerald-600 px-3 py-1 text-xs font-semibold text-white hover:bg-emerald-700 disabled:opacity-60"
+                                  onClick={() => { void onConfirmDraft(row.draftId!); }}
+                                >
+                                  Confirm
+                                </button>
+                              )}
+                            </td>
+                          </tr>
+                        ));
+                      })()}
 
                       {!studentLedgerLoading && !studentLedgerError && ledgerTab === "audit" && (studentLedger?.timeline ?? []).slice(0, 12).map((row) => (
                         <tr key={row.id}>

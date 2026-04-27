@@ -2,6 +2,7 @@ import { Router } from "express";
 import { body } from "express-validator";
 import { prisma } from "../lib/prisma.js";
 import { writeAuditLog } from "../lib/audit.js";
+import { normalizePermissions } from "../lib/permissions.js";
 import { authenticate, getScopedCollegeId, requirePermission, requireRole, type AuthenticatedRequest } from "../middleware/auth.js";
 import { handleValidation } from "../middleware/validate.js";
 
@@ -93,6 +94,124 @@ adminRouter.get("/admin/users", requireRole("SUPER_ADMIN"), async (_req, res) =>
       staff: user.staff,
     }))
   );
+});
+
+adminRouter.get("/admin/custom-roles", requirePermission("SETTINGS_COLLEGE", "HR_WRITE"), async (req: AuthenticatedRequest, res) => {
+  const scopedCollegeId = getScopedCollegeId(req, req.query.collegeId as string | undefined);
+  if (scopedCollegeId === "__FORBIDDEN__") {
+    res.status(403).json({ message: "Cannot access another college" });
+    return;
+  }
+
+  const roles = await prisma.customRole.findMany({
+    where: scopedCollegeId ? { collegeId: scopedCollegeId } : {},
+    include: { _count: { select: { staff: true } } },
+    orderBy: [{ collegeId: "asc" }, { name: "asc" }],
+  });
+
+  res.json(roles.map((role) => ({ ...role, permissions: normalizePermissions(role.permissions) })));
+});
+
+adminRouter.post(
+  "/admin/custom-roles",
+  requirePermission("SETTINGS_COLLEGE"),
+  [body("collegeId").notEmpty(), body("name").notEmpty(), body("permissions").isArray({ min: 0 })],
+  handleValidation,
+  async (req: AuthenticatedRequest, res) => {
+    const scopedCollegeId = getScopedCollegeId(req, req.body.collegeId as string);
+    if (scopedCollegeId === "__FORBIDDEN__") {
+      res.status(403).json({ message: "Cannot create roles for another college" });
+      return;
+    }
+
+    const permissions = normalizePermissions(req.body.permissions);
+    const created = await prisma.customRole.create({
+      data: {
+        collegeId: scopedCollegeId ?? req.body.collegeId,
+        name: String(req.body.name).trim(),
+        permissions,
+      },
+    });
+
+    await writeAuditLog(prisma, {
+      actorUserId: req.user?.id,
+      action: "CUSTOM_ROLE_CREATED",
+      entityType: "CUSTOM_ROLE",
+      entityId: created.id,
+      metadata: { collegeId: created.collegeId, permissions },
+    });
+
+    res.status(201).json({ ...created, permissions });
+  }
+);
+
+adminRouter.patch(
+  "/admin/custom-roles/:roleId",
+  requirePermission("SETTINGS_COLLEGE"),
+  [body("name").optional().notEmpty(), body("permissions").optional().isArray({ min: 0 })],
+  handleValidation,
+  async (req: AuthenticatedRequest, res) => {
+    const existing = await prisma.customRole.findUnique({ where: { id: req.params.roleId }, select: { id: true, collegeId: true } });
+    if (!existing) {
+      res.status(404).json({ message: "Custom role not found" });
+      return;
+    }
+
+    const scopedCollegeId = getScopedCollegeId(req, existing.collegeId);
+    if (scopedCollegeId === "__FORBIDDEN__") {
+      res.status(403).json({ message: "Cannot update another college's custom role" });
+      return;
+    }
+
+    const permissions = req.body.permissions !== undefined ? normalizePermissions(req.body.permissions) : undefined;
+    const updated = await prisma.customRole.update({
+      where: { id: req.params.roleId },
+      data: {
+        ...(req.body.name !== undefined ? { name: String(req.body.name).trim() } : {}),
+        ...(permissions !== undefined ? { permissions } : {}),
+      },
+    });
+
+    await writeAuditLog(prisma, {
+      actorUserId: req.user?.id,
+      action: "CUSTOM_ROLE_UPDATED",
+      entityType: "CUSTOM_ROLE",
+      entityId: updated.id,
+      metadata: { collegeId: updated.collegeId, permissions: permissions ?? normalizePermissions(updated.permissions) },
+    });
+
+    res.json({ ...updated, permissions: normalizePermissions(updated.permissions) });
+  }
+);
+
+adminRouter.delete("/admin/custom-roles/:roleId", requirePermission("SETTINGS_COLLEGE"), async (req: AuthenticatedRequest, res) => {
+  const existing = await prisma.customRole.findUnique({ where: { id: req.params.roleId }, include: { _count: { select: { staff: true } } } });
+  if (!existing) {
+    res.status(404).json({ message: "Custom role not found" });
+    return;
+  }
+
+  const scopedCollegeId = getScopedCollegeId(req, existing.collegeId);
+  if (scopedCollegeId === "__FORBIDDEN__") {
+    res.status(403).json({ message: "Cannot delete another college's custom role" });
+    return;
+  }
+
+  if (existing._count.staff > 0) {
+    res.status(409).json({ message: "Cannot delete a custom role that is assigned to staff members" });
+    return;
+  }
+
+  await prisma.customRole.delete({ where: { id: req.params.roleId } });
+  await writeAuditLog(prisma, {
+    actorUserId: req.user?.id,
+    action: "CUSTOM_ROLE_DELETED",
+    entityType: "CUSTOM_ROLE",
+    entityId: existing.id,
+    metadata: { collegeId: existing.collegeId, name: existing.name },
+  });
+
+  res.json({ message: "Custom role deleted successfully" });
 });
 
 adminRouter.post(

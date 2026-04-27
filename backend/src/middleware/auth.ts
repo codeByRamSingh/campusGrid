@@ -1,6 +1,6 @@
 import { NextFunction, Request, Response } from "express";
 import { verifyToken } from "../lib/auth.js";
-import { getPermissionsForUser, type AppPermission, type StaffRoleName } from "../lib/permissions.js";
+import { getPermissionsForUser, type AppPermission } from "../lib/permissions.js";
 import { prisma } from "../lib/prisma.js";
 
 type AuthRole = "SUPER_ADMIN" | "STAFF";
@@ -11,21 +11,33 @@ export type AuthenticatedRequest = Request & {
     email: string;
     role: AuthRole;
     staffId?: string;
-    staffRole?: StaffRoleName;
+    staffRole?: string;
+    customRoleId?: string;
+    customRoleName?: string;
     collegeId?: string;
     permissions: AppPermission[];
   };
 };
 
 export async function authenticate(req: AuthenticatedRequest, res: Response, next: NextFunction): Promise<void> {
-  const header = req.headers.authorization;
-  if (!header || !header.startsWith("Bearer ")) {
+  // Try httpOnly cookie first, then fall back to Authorization header (for API clients / mobile)
+  let token: string | undefined;
+  const cookieToken = (req.cookies as Record<string, string | undefined>)["campusgrid_token"];
+  if (cookieToken) {
+    token = cookieToken;
+  } else {
+    const header = req.headers.authorization;
+    if (header && header.startsWith("Bearer ")) {
+      token = header.slice(7);
+    }
+  }
+
+  if (!token) {
     res.status(401).json({ message: "Missing authorization token" });
     return;
   }
 
   try {
-    const token = header.slice(7);
     const payload = verifyToken(token);
     const user = await prisma.user.findUnique({
       where: { id: payload.sub },
@@ -40,6 +52,14 @@ export async function authenticate(req: AuthenticatedRequest, res: Response, nex
             role: true,
             collegeId: true,
             isActive: true,
+            customRoleId: true,
+            customRole: {
+              select: {
+                id: true,
+                name: true,
+                permissions: true,
+              },
+            },
           },
         },
       },
@@ -60,9 +80,14 @@ export async function authenticate(req: AuthenticatedRequest, res: Response, nex
       email: user.email,
       role: user.role,
       staffId: user.staffId ?? undefined,
-      staffRole: user.staff?.role,
+      staffRole: user.staff?.customRole?.name ?? user.staff?.role,
+      customRoleId: user.staff?.customRoleId ?? undefined,
+      customRoleName: user.staff?.customRole?.name ?? undefined,
       collegeId: user.staff?.collegeId,
-      permissions: getPermissionsForUser(user.role, user.staff?.role),
+      permissions: getPermissionsForUser(user.role, user.staff?.role, {
+        hasCustomRole: Boolean(user.staff?.customRoleId),
+        customRolePermissions: user.staff?.customRole?.permissions,
+      }),
     };
     next();
   } catch {

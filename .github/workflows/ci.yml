@@ -29,3 +29,37 @@ jobs:
       - name: Build frontend
         working-directory: frontend
         run: npm run build
+
+  runtime-certification:
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Create CI .env
+        run: |
+          JWT_SECRET_VALUE="$(openssl rand -hex 64)"
+          POSTGRES_PASSWORD_VALUE="ci-postgres-pass"
+          cat > .env <<EOF
+          POSTGRES_DB=campusgrid
+          POSTGRES_USER=postgres
+          POSTGRES_PASSWORD=${POSTGRES_PASSWORD_VALUE}
+          DATABASE_URL=postgresql://postgres:${POSTGRES_PASSWORD_VALUE}@db:5432/campusgrid?schema=public
+          JWT_SECRET=${JWT_SECRET_VALUE}
+          PORT=4000
+          CORS_ORIGINS=http://localhost:80,http://localhost,http://localhost:5173
+          FRONTEND_URL=http://localhost
+          SMTP_HOST=
+          SMTP_PORT=587
+          SMTP_USER=
+          SMTP_PASS=
+          SMTP_FROM=noreply@campusgrid.local
+          EOF
+
+      - name: Run runtime certification
+        run: ./scripts/runtime-certify.sh
