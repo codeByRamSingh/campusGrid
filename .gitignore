@@ -21,3 +21,4 @@ backend/storage/
 .DS_Store
 *.swp
 *.swo
+graphify-out/
