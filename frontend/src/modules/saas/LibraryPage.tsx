@@ -3,6 +3,9 @@ import { BookOpen, Plus, Search, BookMarked, RotateCcw, AlertCircle } from "luci
 import { toast } from "sonner";
 import { api } from "../../services/api";
 import { hasPermission } from "../../lib/permissions";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useStudents } from "../../hooks/useStudents";
 
 type College = { id: string; name: string };
 type Student = { id: string; candidateName: string; admissionNumber: number };
@@ -38,12 +41,6 @@ export type LibraryTransaction = {
   student: { id: string; candidateName: string; admissionNumber: number };
 };
 
-type Props = {
-  colleges: College[];
-  students: Student[];
-  permissions: string[];
-  loading: boolean;
-};
 
 const STATUS_STYLES: Record<string, string> = {
   ISSUED: "bg-blue-900/40 text-blue-300",
@@ -52,7 +49,12 @@ const STATUS_STYLES: Record<string, string> = {
   LOST: "bg-slate-700 text-slate-400",
 };
 
-export default function LibraryPage({ colleges, students, permissions, loading }: Props) {
+export default function LibraryPage() {
+  const { permissions } = useAuth();
+  const { data: academicStructure = [], isFetching: loading } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({ id: c.id, name: c.name }));
+  const { data: studentsPayload } = useStudents();
+  const students: Student[] = (Array.isArray(studentsPayload) ? studentsPayload : (studentsPayload?.data ?? [])).map((s) => ({ id: s.id, candidateName: s.candidateName, admissionNumber: s.admissionNumber }));
   const canWrite = hasPermission(permissions, "LIBRARY_WRITE");
 
   const [books, setBooks] = useState<LibraryBook[]>([]);

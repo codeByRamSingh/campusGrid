@@ -6,6 +6,12 @@ import { CriticalIssuesList } from "../../components/dashboard/CriticalIssuesLis
 import { KPIStrip } from "../../components/dashboard/KPIStrip";
 import { OutstandingAgingChart } from "../../components/dashboard/OutstandingAgingChart";
 import { RevenueVsCollectionChart } from "../../components/dashboard/RevenueVsCollectionChart";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useStudents } from "../../hooks/useStudents";
+import { useStaff, useAttendance, usePayroll } from "../../hooks/useHr";
+import { useLedger } from "../../hooks/useFinanceLedger";
+import { useWorkflowInbox } from "../../hooks/useWorkflow";
+import { useDashboardSummary } from "../../hooks/useReports";
 
 type College = {
   id: string;
@@ -97,31 +103,45 @@ type DashboardSummary = {
   }>;
 };
 
-type Props = {
-  colleges: College[];
-  students: Student[];
-  staff: Staff[];
-  attendanceRows: Attendance[];
-  leaveRows: Leave[];
-  payrollRows: Payroll[];
-  ledger: Ledger;
-  workflowInbox: WorkflowInbox;
-  dashboardSummary: DashboardSummary | null;
-  loading: boolean;
-  dashboardFilters: {
-    collegeId: string;
-    courseId: string;
-    sessionId: string;
-  };
-  onChangeDashboardFilters: (next: { collegeId?: string; courseId?: string; sessionId?: string }) => void;
-  onRunAdmissionAction: (studentId: string, action: "SEND_FOR_APPROVAL" | "APPROVE" | "REJECT" | "REQUEST_CHANGES") => Promise<void>;
-  onUpdateLeaveStatus: (leaveRequestId: string, status: "APPROVED" | "REJECTED") => Promise<void>;
-  onNavigate: (target: "students" | "finance" | "hr" | "admin" | "settings" | "dashboard") => void;
-};
+type NavTarget = "students" | "finance" | "hr" | "admin" | "settings" | "dashboard";
+type Props = { onNavigate: (target: NavTarget) => void };
 
-export function DashboardPage({ colleges, students, staff, attendanceRows, payrollRows, ledger, workflowInbox, dashboardSummary, dashboardFilters, onChangeDashboardFilters, onNavigate }: Props) {
+export function DashboardPage({ onNavigate }: Props) {
   const [dateRange, setDateRange] = useState<"month" | "quarter" | "year">("month");
   const [txnFilter, setTxnFilter] = useState<"today" | "week" | "month">("month");
+  const [dashboardFilters, setDashboardFilters] = useState({ collegeId: "ALL", courseId: "ALL", sessionId: "ALL" });
+
+  const onChangeDashboardFilters = (next: { collegeId?: string; courseId?: string; sessionId?: string }) =>
+    setDashboardFilters((prev) => ({ ...prev, ...next }));
+
+  const filterParams = {
+    ...(dashboardFilters.collegeId !== "ALL" ? { collegeId: dashboardFilters.collegeId } : {}),
+    ...(dashboardFilters.courseId !== "ALL" ? { courseId: dashboardFilters.courseId } : {}),
+    ...(dashboardFilters.sessionId !== "ALL" ? { sessionId: dashboardFilters.sessionId } : {}),
+  };
+
+  const { data: academicStructure = [] } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({
+    id: c.id,
+    name: c.name,
+    courses: c.courses.map((course) => ({
+      id: course.id,
+      name: course.name,
+      sessions: course.sessions.map((s) => ({ id: s.id, label: s.label, seatCount: s.seatCount, sessionFee: s.sessionFee })),
+    })),
+  }));
+  const { data: studentsPayload } = useStudents();
+  const students: Student[] = Array.isArray(studentsPayload) ? studentsPayload : (studentsPayload?.data ?? []);
+  const { data: staff = [] } = useStaff();
+  const { data: attendanceData } = useAttendance();
+  const attendanceRows: Attendance[] = attendanceData?.data ?? [];
+  const { data: payrollRows = [] } = usePayroll();
+  const { data: ledgerRaw } = useLedger({ period: "monthly" });
+  const ledger = (ledgerRaw ?? null) as unknown as Ledger;
+  const { data: workflowInboxRaw } = useWorkflowInbox(filterParams);
+  const workflowInbox = (workflowInboxRaw ?? { sections: [], summary: { approvals: 0, exceptions: 0, tasks: 0, total: 0 } }) as unknown as WorkflowInbox;
+  const { data: dashboardSummaryRaw } = useDashboardSummary(filterParams);
+  const dashboardSummary = (dashboardSummaryRaw ?? null) as unknown as DashboardSummary | null;
 
   const filteredStudents = useMemo(
     () =>

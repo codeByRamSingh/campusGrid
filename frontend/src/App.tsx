@@ -1,4 +1,12 @@
 import { Suspense, lazy, useEffect, useMemo, useState } from "react";
+import { useAuth } from "./contexts/AuthContext";
+import { useAcademicStructure, useUsers, useCustomRoles, useCreateCollege, useUpdateCollege, useDeleteCollege, useCreateCourse, useUpdateCourse, useDeleteCourse, useCreateSession, useUpdateSession, useDeleteSession, useCreateSubject, useUpdateSubject, useDeleteSubject, useCreateCustomRole, useUpdateCustomRole, useDeleteCustomRole } from "./hooks/useAcademicStructure";
+import { useSettings, useUpdateSettings } from "./hooks/useSettings";
+import { useMyNotifications, useMarkNotificationRead, useMarkAllNotificationsRead } from "./hooks/useNotifications";
+import { useWorkflowInbox } from "./hooks/useWorkflow";
+import { useStudents } from "./hooks/useStudents";
+import { useLeaveRequests } from "./hooks/useHr";
+import { hasAnyPermission, hasPermission } from "./lib/permissions";
 import {
   Bell,
   BookOpen,
@@ -24,10 +32,7 @@ import {
 } from "lucide-react";
 import { Toaster, toast } from "sonner";
 import { AnimatePresence, motion } from "framer-motion";
-import axios from "axios";
 import { LoginForm } from "./components/LoginForm";
-import { hasAnyPermission, hasPermission } from "./lib/permissions";
-import { api, type LoginResponse } from "./services/api";
 
 const DashboardPage = lazy(() => import("./modules/saas/DashboardPage").then((module) => ({ default: module.DashboardPage })));
 const StudentsPage = lazy(() => import("./modules/saas/StudentsPage").then((module) => ({ default: module.StudentsPage })));
@@ -38,8 +43,6 @@ const ExamPage = lazy(() => import("./modules/saas/ExamPage").then((module) => (
 const HostelPage = lazy(() => import("./modules/saas/HostelPage").then((module) => ({ default: module.default })));
 const LibraryPage = lazy(() => import("./modules/saas/LibraryPage").then((module) => ({ default: module.default })));
 const TransportPage = lazy(() => import("./modules/saas/TransportPage").then((module) => ({ default: module.default })));
-
-type UserSession = LoginResponse["user"];
 
 type College = {
   id: string;
@@ -61,109 +64,7 @@ type College = {
   }>;
 };
 
-type Student = {
-  id: string;
-  candidateName: string;
-  admissionNumber: number;
-  admissionCode?: string;
-  status: string;
-  totalPayable: number;
-  collegeId: string;
-  createdAt?: string;
-  admissions?: Array<{ id: string; courseId: string; sessionId: string; createdAt?: string }>;
-};
-
-type StudentListResponse = {
-  data: Student[];
-  nextCursor?: string;
-  hasMore: boolean;
-};
-
-type StudentListPayload = Student[] | StudentListResponse;
-
-type Staff = {
-  id: string;
-  fullName: string;
-  email: string;
-  mobile: string;
-  collegeId: string;
-  role?: string;
-  designation?: string;
-  staffType?: string;
-  employmentType?: string;
-  joiningDate?: string;
-};
-
-type SalaryConfig = {
-  id: string;
-  staffId: string;
-  basicSalary: number;
-  hra: number;
-  da: number;
-  otherAllowances: number;
-  bankAccountNumber: string | null;
-  bankName: string | null;
-  ifscCode: string | null;
-  pan: string | null;
-  pfUan: string | null;
-  paymentMode: string;
-};
-
-type SalaryConfigMap = Record<string, SalaryConfig>;
-
-type AttendanceRow = { id: string; date: string; status: string; staff: { fullName: string } };
-type LeaveRow = { id: string; fromDate: string; toDate: string; status: string; staff: { fullName: string }; reason: string };
-type PayrollRow = { id: string; month: number; year: number; amount: number; status: string; paidAt?: string | null; staff: { id: string; fullName: string } };
-type ExpenseRow = { id: string; amount: number; category: string; spentOn: string; notes?: string };
-
-type PaginatedResponse<T> = {
-  data: T[];
-  nextCursor?: string;
-  hasMore: boolean;
-};
-
-type ReceivablesAging = {
-  buckets: Array<{ label: string; count: number; amount: number }>;
-  defaulters: Array<{ studentId: string; admissionNumber: number; admissionCode?: string; candidateName: string; due: number; daysOutstanding: number }>;
-};
-
 type NavKey = "dashboard" | "students" | "finance" | "hr" | "exceptions" | "exam" | "hostel" | "library" | "transport" | "admin" | "settings";
-
-type ExceptionStatus = "NEW" | "TRIAGED" | "ASSIGNED" | "IN_PROGRESS" | "RESOLVED" | "CLOSED" | "REOPENED";
-
-type ExceptionCaseRow = {
-  id: string;
-  collegeId: string;
-  module: string;
-  category: string;
-  severity: "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
-  title: string;
-  description: string;
-  status: ExceptionStatus;
-  retryCount: number;
-  maxRetries: number;
-  createdAt: string;
-};
-
-type ExceptionMetrics = {
-  total: number;
-  resolved: number;
-  reopened: number;
-  resolutionRate: number;
-  mttrHours: number;
-  byStatus: Array<{ status: string; count: number }>;
-  bySeverity: Array<{ severity: string; count: number }>;
-  aging: Array<{ bucket: string; count: number }>;
-};
-
-type Ledger = {
-  openingBalance: number;
-  totalFeeDeposit: number;
-  totalMiscCredits: number;
-  totalExpenses: number;
-  totalPayroll: number;
-  closingBalance: number;
-};
 
 type WorkflowInbox = {
   sections: Array<{
@@ -171,18 +72,9 @@ type WorkflowInbox = {
     title: string;
     count: number;
     nav: NavKey;
-    items: Array<{
-      id: string;
-      title: string;
-      subtitle: string;
-    }>;
+    items: Array<{ id: string; title: string; subtitle: string }>;
   }>;
-  summary: {
-    approvals: number;
-    exceptions: number;
-    tasks: number;
-    total: number;
-  };
+  summary: { approvals: number; exceptions: number; tasks: number; total: number };
 };
 
 type NotificationItem = {
@@ -194,98 +86,12 @@ type NotificationItem = {
   isRead: boolean;
 };
 
-type InAppNotificationLog = {
-  id: string;
-  subject: string;
-  body: string;
-  isRead: boolean;
-  metadata?: {
-    nav?: NavKey;
-    severity?: "info" | "warning" | "critical";
-  };
-};
-
-type InAppNotificationsResponse = {
-  unreadCount: number;
-  notifications: InAppNotificationLog[];
-};
-
-type DashboardSummary = {
-  kpis: {
-    totalFeeCollected: number;
-    outstandingFees: number;
-    collectionRate: number;
-    newAdmissions: number;
-    admissionTrend: number;
-    payrollCost: number;
-    staffStrength: number;
-    complianceAlerts: number;
-    seatUtilization: number;
-    activeStudents: number;
-    totalSeats: number;
-  };
-  collectionByCollege: Array<{
-    collegeId: string;
-    college: string;
-    billed: number;
-    collected: number;
-    outstanding: number;
-    collectionPct: number;
-    admissions: number;
-  }>;
-  admissionsPipeline: Array<{ stage: string; value: number; conversionPct: number }>;
-  receivablesAging: {
-    buckets: Array<{ label: string; count: number; amount: number }>;
-    defaulters: Array<{ studentId: string; admissionNumber: number; admissionCode?: string; candidateName: string; due: number; daysOutstanding: number }>;
-  };
-  recentFeeSubmissions: Array<{
-    id: string;
-    receiptNumber: string;
-    cycleLabel?: string | null;
-    amount: number;
-    collectedAt: string;
-    studentId: string;
-    candidateName: string;
-    admissionRef: string;
-    college: string;
-  }>;
-};
-
-type DashboardFilters = {
-  collegeId: string;
-  courseId: string;
-  sessionId: string;
-};
-
-type SettingsSnapshot = {
-  trust: {
-    id: string;
-    name: string;
-    establishmentYear: number;
-    registrationNumber: string;
-  } | null;
-  security: {
-    staffDefaultPasswordPolicy: string;
-    authStandard: string;
-  };
-  localization: {
-    timezone: string;
-    currency: string;
-    dateFormat: string;
-  };
-};
-
 type LoginAccount = {
   id: string;
   email: string;
   role: "SUPER_ADMIN" | "STAFF";
   createdAt: string;
-  staff: {
-    id: string;
-    fullName: string;
-    collegeId: string;
-    isActive: boolean;
-  } | null;
+  staff: { id: string; fullName: string; collegeId: string; isActive: boolean } | null;
 };
 
 type CustomRole = {
@@ -319,77 +125,28 @@ const queueItems = [
 ];
 
 export default function App() {
-  const [user, setUser] = useState<UserSession | null>(null);
+  const { user, permissions, login, logout: authLogout } = useAuth();
   const [activeNav, setActiveNav] = useState<NavKey>("dashboard");
   const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
   const [globalSearch, setGlobalSearch] = useState("");
-  const [busy, setBusy] = useState(false);
   const [createMenuOpen, setCreateMenuOpen] = useState(false);
   const [profileMenuOpen, setProfileMenuOpen] = useState(false);
   const [inboxOpen, setInboxOpen] = useState(false);
   const [notificationOpen, setNotificationOpen] = useState(false);
-  const [inAppNotifications, setInAppNotifications] = useState<InAppNotificationLog[]>([]);
-  const [unreadInAppCount, setUnreadInAppCount] = useState(0);
   const [commandPaletteOpen, setCommandPaletteOpen] = useState(false);
   const [commandQuery, setCommandQuery] = useState("");
 
-  const [colleges, setColleges] = useState<College[]>([]);
-  const [students, setStudents] = useState<Student[]>([]);
-  const [staff, setStaff] = useState<Staff[]>([]);
-  const [salaryConfigs, setSalaryConfigs] = useState<SalaryConfigMap>({});
-  const [attendanceRows, setAttendanceRows] = useState<AttendanceRow[]>([]);
-  const [leaveRows, setLeaveRows] = useState<LeaveRow[]>([]);
-  const [payrollRows, setPayrollRows] = useState<PayrollRow[]>([]);
-  const [expenseReport, setExpenseReport] = useState<ExpenseRow[]>([]);
-  const [duesReport, setDuesReport] = useState<Array<{ studentId: string; candidateName: string; due: number; fines: number }>>([]);
-  const [receivablesAging, setReceivablesAging] = useState<ReceivablesAging>({ buckets: [], defaulters: [] });
-  const [ledger, setLedger] = useState<Ledger | null>(null);
-  const [dashboardSummary, setDashboardSummary] = useState<DashboardSummary | null>(null);
-  const [workflowInbox, setWorkflowInbox] = useState<WorkflowInbox>({
-    sections: [],
-    summary: { approvals: 0, exceptions: 0, tasks: 0, total: 0 },
-  });
-  const [settingsSnapshot, setSettingsSnapshot] = useState<SettingsSnapshot | null>(null);
-  const [loginAccounts, setLoginAccounts] = useState<LoginAccount[]>([]);
-  const [customRoles, setCustomRoles] = useState<CustomRole[]>([]);
-  const [exceptions, setExceptions] = useState<ExceptionCaseRow[]>([]);
-  const [exceptionMetrics, setExceptionMetrics] = useState<ExceptionMetrics | null>(null);
-  const [dashboardFilters, setDashboardFilters] = useState<DashboardFilters>({
-    collegeId: "ALL",
-    courseId: "ALL",
-    sessionId: "ALL",
-  });
-
-  useEffect(() => {
-    // Token is in httpOnly cookie; just restore the user session from localStorage
-    const userRaw = localStorage.getItem("campusgrid_user");
-    if (userRaw) {
-      setUser(JSON.parse(userRaw) as UserSession);
-    }
-  }, []);
-
-  useEffect(() => {
-    if (!user) {
-      return;
-    }
-
-    void refreshAll();
-  }, [user, dashboardFilters.collegeId, dashboardFilters.courseId, dashboardFilters.sessionId]);
-
-  const allPermissions = [
-    "ACADEMIC_READ", "ADMIN_MANAGE", "AUDIT_READ", "ADMISSIONS_APPROVE",
-    "FINANCE_APPROVE", "FINANCE_READ", "FINANCE_WRITE", "HR_ATTENDANCE",
-    "HR_READ", "HR_WRITE", "PAYROLL_READ", "REPORTS_READ", "SETTINGS_MANAGE", "SETTINGS_COLLEGE",
-    "STUDENTS_READ", "STUDENTS_WRITE", "WORKFLOW_READ", "EXCEPTIONS_READ", "EXCEPTIONS_WRITE", "EXCEPTIONS_RESOLVE",
-    "EXAM_READ", "EXAM_WRITE", "HOSTEL_READ", "HOSTEL_WRITE", "LIBRARY_READ", "LIBRARY_WRITE", "TRANSPORT_READ", "TRANSPORT_WRITE",
-  ];
-  // Super admins always have all permissions regardless of what the cached token carries
-  const permissions = user?.role === "SUPER_ADMIN" ? allPermissions : (user?.permissions ?? []);
+  const { data: notificationsData } = useMyNotifications();
+  const markReadMutation = useMarkNotificationRead();
+  const markAllReadMutation = useMarkAllNotificationsRead();
+  const { data: workflowInboxData } = useWorkflowInbox();
+  const { data: studentsForBadge } = useStudents();
+  const { data: leaveData } = useLeaveRequests();
+  const { data: settingsData } = useSettings();
   const canViewDashboard = hasPermission(permissions, "REPORTS_READ");
   const canViewStudents = hasPermission(permissions, "STUDENTS_READ");
   const canViewFinance = hasPermission(permissions, "FINANCE_READ");
   const canViewHr = hasAnyPermission(permissions, ["HR_READ", "HR_ATTENDANCE"]);
-  const canViewPayroll = hasPermission(permissions, "PAYROLL_READ");
   const canViewExceptions = hasPermission(permissions, "EXCEPTIONS_READ");
   const canViewAdmin = user?.role === "SUPER_ADMIN";
   const canViewSettings = user?.role === "SUPER_ADMIN";
@@ -451,210 +208,38 @@ export default function App() {
     return () => window.removeEventListener("keydown", handleKeyDown);
   }, []);
 
-  useEffect(() => {
-    function handleSessionExpired() {
-      localStorage.removeItem("campusgrid_user");
-      setUser(null);
-      setInAppNotifications([]);
-      setUnreadInAppCount(0);
-      toast.error("Session expired. Please login again.");
-    }
-    window.addEventListener("campusgrid:session-expired", handleSessionExpired);
-    return () => window.removeEventListener("campusgrid:session-expired", handleSessionExpired);
-  }, []);
-
-  async function withBusy<T>(task: () => Promise<T>) {
-    setBusy(true);
-    try {
-      return await task();
-    } catch (error) {
-      console.error(error);
-      if (axios.isAxiosError(error)) {
-        if (error.response?.status === 401) {
-          localStorage.removeItem("campusgrid_user");
-          setUser(null);
-          toast.error("Session expired. Please login again.");
-          return;
-        }
-
-        const serverMessage =
-          (error.response?.data as { message?: string } | undefined)?.message ??
-          "Something went wrong. Please try again.";
-        toast.error(serverMessage);
-        return;
-      }
-
-      toast.error("Something went wrong. Please try again.");
-      return;
-    } finally {
-      setBusy(false);
-    }
-  }
-
-  async function refreshAll() {
-    const canReadAcademics = user?.role === "SUPER_ADMIN" || hasPermission(permissions, "ACADEMIC_READ");
-    const canReadWorkflow = hasPermission(permissions, "WORKFLOW_READ");
-    const canReadReports = hasPermission(permissions, "REPORTS_READ");
-
-    try {
-      const [
-        structureRes,
-        studentsRes,
-        staffRes,
-        salaryConfigsRes,
-        attendanceRes,
-        leaveRes,
-        payrollRes,
-        ledgerRes,
-        expenseRes,
-        duesRes,
-        agingRes,
-        dashboardSummaryRes,
-        workflowRes,
-        notificationsRes,
-        settingsRes,
-        usersRes,
-        customRolesRes,
-        exceptionsRes,
-        exceptionMetricsRes,
-      ] = await Promise.all([
-        canReadAcademics ? api.get<College[]>("/admin/academic-structure") : Promise.resolve({ data: [] as College[] }),
-        canViewStudents ? api.get<StudentListPayload>("/students") : Promise.resolve({ data: { data: [], hasMore: false } as StudentListResponse }),
-        canViewHr ? api.get<Staff[]>("/hr/staff") : Promise.resolve({ data: [] as Staff[] }),
-        canViewPayroll ? api.get<SalaryConfigMap>("/hr/salary-configs") : Promise.resolve({ data: {} as SalaryConfigMap }),
-        canViewHr ? api.get<PaginatedResponse<AttendanceRow>>("/hr/attendance") : Promise.resolve({ data: { data: [], hasMore: false } as PaginatedResponse<AttendanceRow> }),
-        canViewHr ? api.get<PaginatedResponse<LeaveRow>>("/hr/leave-requests") : Promise.resolve({ data: { data: [], hasMore: false } as PaginatedResponse<LeaveRow> }),
-        canViewHr ? api.get<PayrollRow[]>("/hr/payroll") : Promise.resolve({ data: [] as PayrollRow[] }),
-        canViewFinance ? api.get<Ledger>("/finance/ledger", { params: { period: "monthly" } }) : Promise.resolve({ data: null as Ledger | null }),
-        canReadReports ? api.get<PaginatedResponse<ExpenseRow>>("/reports/expenses") : Promise.resolve({ data: { data: [], hasMore: false } as PaginatedResponse<ExpenseRow> }),
-        canReadReports
-          ? api.get<Array<{ studentId: string; candidateName: string; due: number; fines: number }>>("/reports/dues-fines")
-          : Promise.resolve({ data: [] as Array<{ studentId: string; candidateName: string; due: number; fines: number }> }),
-        canReadReports ? api.get<ReceivablesAging>("/reports/receivables-aging") : Promise.resolve({ data: { buckets: [], defaulters: [] } as ReceivablesAging }),
-        canReadReports
-          ? api.get<DashboardSummary>("/reports/dashboard-summary", {
-              params: {
-                ...(dashboardFilters.collegeId !== "ALL" ? { collegeId: dashboardFilters.collegeId } : {}),
-                ...(dashboardFilters.courseId !== "ALL" ? { courseId: dashboardFilters.courseId } : {}),
-                ...(dashboardFilters.sessionId !== "ALL" ? { sessionId: dashboardFilters.sessionId } : {}),
-              },
-            })
-          : Promise.resolve({ data: null as DashboardSummary | null }),
-        canReadWorkflow
-          ? api.get<WorkflowInbox>("/workflow/inbox", {
-              params: {
-                ...(dashboardFilters.collegeId !== "ALL" ? { collegeId: dashboardFilters.collegeId } : {}),
-                ...(dashboardFilters.courseId !== "ALL" ? { courseId: dashboardFilters.courseId } : {}),
-                ...(dashboardFilters.sessionId !== "ALL" ? { sessionId: dashboardFilters.sessionId } : {}),
-              },
-            })
-          : Promise.resolve({ data: { sections: [], summary: { approvals: 0, exceptions: 0, tasks: 0, total: 0 } } as WorkflowInbox }),
-        api.get<InAppNotificationsResponse>("/notifications/mine", { params: { limit: 30 } }),
-        api.get<SettingsSnapshot>("/settings"),
-        user?.role === "SUPER_ADMIN" ? api.get<LoginAccount[]>("/admin/users") : Promise.resolve({ data: [] as LoginAccount[] }),
-        hasPermission(permissions, "HR_WRITE") || user?.role === "SUPER_ADMIN" ? api.get<CustomRole[]>("/admin/custom-roles") : Promise.resolve({ data: [] as CustomRole[] }),
-        canViewExceptions ? api.get<ExceptionCaseRow[]>("/exceptions") : Promise.resolve({ data: [] as ExceptionCaseRow[] }),
-        canViewExceptions ? api.get<ExceptionMetrics>("/exceptions/metrics") : Promise.resolve({ data: null as ExceptionMetrics | null }),
-      ]);
-
-      setColleges(structureRes.data);
-      setStudents(Array.isArray(studentsRes.data) ? studentsRes.data : studentsRes.data.data);
-      setStaff(staffRes.data);
-      setSalaryConfigs(salaryConfigsRes.data);
-      setAttendanceRows(attendanceRes.data.data);
-      setLeaveRows(leaveRes.data.data);
-      setPayrollRows(payrollRes.data);
-      setLedger(ledgerRes.data);
-      setExpenseReport(expenseRes.data.data);
-      setDuesReport(duesRes.data);
-      setReceivablesAging(agingRes.data);
-      setDashboardSummary(dashboardSummaryRes.data);
-      setWorkflowInbox(workflowRes.data);
-      setInAppNotifications(notificationsRes.data.notifications ?? []);
-      setUnreadInAppCount(notificationsRes.data.unreadCount ?? 0);
-      setSettingsSnapshot(settingsRes.data);
-      setLoginAccounts(usersRes.data);
-      setCustomRoles(customRolesRes.data);
-      setExceptions(exceptionsRes.data);
-      setExceptionMetrics(exceptionMetricsRes.data);
-    } catch (error) {
-      console.error(error);
-      if (axios.isAxiosError(error) && error.response?.status === 401) {
-        localStorage.removeItem("campusgrid_user");
-        setUser(null);
-        toast.error("Session expired. Please login again.");
-        return;
-      }
-      toast.error("Unable to refresh latest data. Please retry.");
-    }
-  }
-
-  async function updateSettings(payload: {
-    localization: { timezone: string; currency: string; dateFormat: string };
-    security: { authStandard: string; staffDefaultPasswordPolicy: string };
-  }) {
-    await withBusy(async () => {
-      await api.patch("/settings", payload);
-      await refreshAll();
-      toast.success("Settings updated successfully");
-    });
-  }
-
-  function updateDashboardFilters(next: Partial<DashboardFilters>) {
-    setDashboardFilters((prev) => {
-      const merged: DashboardFilters = { ...prev, ...next };
-      if (Object.prototype.hasOwnProperty.call(next, "collegeId")) {
-        merged.courseId = "ALL";
-        merged.sessionId = "ALL";
-      }
-      if (Object.prototype.hasOwnProperty.call(next, "courseId")) {
-        merged.sessionId = "ALL";
-      }
-      return merged;
-    });
-  }
-
-  function handleLogin(data: LoginResponse) {
-    // Token and refresh token are set as httpOnly cookies by the server
-    localStorage.setItem("campusgrid_user", JSON.stringify(data.user));
-    setUser(data.user);
-    toast.success("Welcome back");
-  }
-
-  function logout() {
-    // Server clears httpOnly cookies; fire-and-forget
-    api.post("/auth/logout").catch(() => {});
-    localStorage.removeItem("campusgrid_user");
-    setUser(null);
-    setInAppNotifications([]);
-    setUnreadInAppCount(0);
-  }
-
   const navBadges = useMemo(
-    () => ({
-      students: students.filter((student) => student.status !== "ACTIVE").length,
-      finance: receivablesAging.defaulters.length,
-      hr: leaveRows.filter((leave) => leave.status === "PENDING").length,
-    }),
-    [students, receivablesAging.defaulters.length, leaveRows]
+    () => {
+      const studentList = Array.isArray(studentsForBadge)
+        ? studentsForBadge
+        : (studentsForBadge as { data?: { status: string }[] } | undefined)?.data ?? [];
+      const leaveList = (leaveData as { data?: { status: string }[] } | undefined)?.data ?? [];
+      return {
+        students: studentList.filter((s) => s.status !== "ACTIVE").length,
+        finance: 0,
+        hr: leaveList.filter((l) => l.status === "PENDING").length,
+      };
+    },
+    [studentsForBadge, leaveData]
   );
 
+  const workflowInbox = (workflowInboxData ?? { sections: [], summary: { approvals: 0, exceptions: 0, tasks: 0, total: 0 } }) as unknown as WorkflowInbox;
   const queueBadges = workflowInbox.summary;
   const approvalInboxItems = workflowInbox.sections;
   const inboxCount = workflowInbox.summary.total;
 
   const notificationItems = useMemo<NotificationItem[]>(() => {
-    return inAppNotifications.map((entry) => ({
+    return (notificationsData ?? []).map((entry) => ({
       id: entry.id,
-      title: entry.subject,
+      title: entry.title,
       subtitle: entry.body,
-      nav: entry.metadata?.nav ?? "dashboard",
-      severity: entry.metadata?.severity ?? "info",
+      nav: (entry.metadata?.nav as NavKey | undefined) ?? "dashboard",
+      severity: (entry.metadata?.severity as "info" | "warning" | "critical" | undefined) ?? "info",
       isRead: entry.isRead,
     }));
-  }, [inAppNotifications]);
+  }, [notificationsData]);
 
-  const unreadNotificationCount = unreadInAppCount;
+  const unreadNotificationCount = notificationItems.filter((n) => !n.isRead).length;
 
   const commandActions = useMemo(
     () => [
@@ -733,333 +318,16 @@ export default function App() {
     }
   }
 
-  async function markNotificationRead(id: string) {
-    const existing = inAppNotifications.find((item) => item.id === id);
-    if (!existing || existing.isRead) {
-      return;
-    }
-
-    try {
-      await api.patch(`/notifications/${id}/read`);
-      setInAppNotifications((current) => current.map((item) => (item.id === id ? { ...item, isRead: true } : item)));
-      setUnreadInAppCount((current) => Math.max(0, current - 1));
-    } catch {
-      toast.error("Unable to mark notification as read");
-    }
-  }
-
-  async function markAllNotificationsRead() {
-    if (unreadInAppCount === 0) {
-      return;
-    }
-
-    try {
-      await api.patch("/notifications/read-all");
-      setInAppNotifications((current) => current.map((item) => ({ ...item, isRead: true })));
-      setUnreadInAppCount(0);
-    } catch {
-      toast.error("Unable to mark all notifications as read");
-    }
-  }
-
   async function openNotification(item: NotificationItem) {
-    await markNotificationRead(item.id);
+    void markReadMutation.mutateAsync(item.id);
     setNotificationOpen(false);
     setActiveNav(item.nav);
-  }
-
-  async function submitAdmission(payload: Record<string, unknown>): Promise<{ id: string; admissionNumber: number; admissionCode?: string; candidateName: string } | void> {
-    return withBusy(async () => {
-      const res = await api.post<{ student: { id: string; admissionNumber: number; admissionCode?: string; candidateName: string } }>("/students/admissions", payload);
-      await refreshAll();
-      toast.success("Admission created successfully");
-      return res.data?.student;
-    });
-  }
-
-  async function deleteStudent(studentId: string) {
-    await withBusy(async () => {
-      await api.patch(`/students/${studentId}`, { status: "SOFT_DELETED" });
-      await refreshAll();
-      toast.success("Student deleted successfully");
-    });
-  }
-
-  async function collectFee(payload: Record<string, unknown>) {
-    return withBusy(async () => {
-      const response = await api.post("/finance/fee-collections", payload);
-      await refreshAll();
-      toast.success("Fee collected");
-      return response.data;
-    });
-  }
-
-  async function addMiscCredit(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/finance/misc-credits", payload);
-      await refreshAll();
-      toast.success("Credit recorded");
-    });
-  }
-
-  async function addExpense(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/finance/expenses", payload);
-      await refreshAll();
-      toast.success("Expense recorded");
-    });
-  }
-
-  async function saveFeeDraft(payload: Record<string, unknown>) {
-    return withBusy(async () => {
-      const response = await api.post("/finance/fee-collections/drafts", payload);
-      await refreshAll();
-      toast.success("Fee draft saved");
-      return response.data;
-    });
-  }
-
-  async function confirmFeeDraft(draftId: string) {
-    await withBusy(async () => {
-      await api.post(`/finance/fee-collections/from-draft/${draftId}`);
-      await refreshAll();
-      toast.success("Draft confirmed and fee collected");
-    });
-  }
-
-  async function raiseFeeException(payload: Record<string, unknown>) {
-    return withBusy(async () => {
-      const response = await api.post("/finance/fee-collections/exceptions", payload);
-      await refreshAll();
-      toast.success("Fee exception submitted for review");
-      return response.data;
-    });
-  }
-
-  async function addStaff(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      const response = await api.post<{ staff: { id: string }; invite?: { inviteLink?: string } }>("/hr/staff", payload);
-      const staffId = response.data.staff?.id;
-      // Persist salary/bank data if provided in onboarding wizard
-      if (staffId && (payload.monthlySalary || payload.bankAccountNumber)) {
-        try {
-          await api.put(`/hr/staff/${staffId}/salary`, {
-            basicSalary: payload.monthlySalary,
-            bankAccountNumber: payload.bankAccountNumber,
-            ifscCode: payload.ifscCode,
-            pan: payload.pan,
-            pfUan: payload.pfUan,
-            paymentMode: payload.paymentMode,
-          });
-        } catch {
-          // Non-fatal: staff was created; salary can be set separately
-        }
-      }
-      await refreshAll();
-      const inviteLink = response.data.invite?.inviteLink;
-      toast.success(inviteLink ? `Staff invited. Setup link generated.` : "Staff member added");
-    });
-  }
-
-  async function saveSalaryConfig(staffId: string, config: Partial<SalaryConfig>) {
-    await withBusy(async () => {
-      await api.put(`/hr/staff/${staffId}/salary`, config);
-      await refreshAll();
-      toast.success("Salary configuration saved");
-    });
-  }
-
-  async function updatePayrollStatus(payrollId: string, status: "PROCESSED" | "PAID" | "REVERSED") {
-    await withBusy(async () => {
-      await api.patch(`/hr/payroll/${payrollId}/status`, { status });
-      await refreshAll();
-      toast.success(`Payroll marked as ${status.toLowerCase()}`);
-    });
-  }
-
-  async function processPayroll(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/hr/payroll", payload);
-      await refreshAll();
-      toast.success("Payroll processed");
-    });
-  }
-
-  async function updateStaff(staffId: string, payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.patch(`/hr/staff/${staffId}`, payload);
-      await refreshAll();
-      toast.success("Staff profile updated");
-    });
-  }
-
-  async function deleteStaff(staffId: string) {
-    await withBusy(async () => {
-      await api.delete(`/hr/staff/${staffId}`);
-      await refreshAll();
-      toast.success("Staff member deleted");
-    });
-  }
-
-  async function updateLeaveStatus(leaveRequestId: string, status: "APPROVED" | "REJECTED") {
-    await withBusy(async () => {
-      await api.patch(`/hr/leave-requests/${leaveRequestId}/status`, { status });
-      await refreshAll();
-      toast.success(`Leave request ${status.toLowerCase()}`);
-    });
-  }
-
-  async function updateAdmissionWorkflowStatus(studentId: string, action: "SEND_FOR_APPROVAL" | "APPROVE" | "REJECT" | "REQUEST_CHANGES") {
-    await withBusy(async () => {
-      await api.patch(`/students/${studentId}/workflow`, {
-        action,
-        notes: action === "REQUEST_CHANGES" ? "Requested edits from dashboard workflow queue." : undefined,
-      });
-      await refreshAll();
-      toast.success(`Admission workflow updated: ${action.replace(/_/g, " ").toLowerCase()}`);
-    });
-  }
-
-  async function addCollege(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/admin/colleges", payload);
-      await refreshAll();
-      toast.success("College added successfully");
-    });
-  }
-
-  async function transitionExceptionStatus(exceptionCaseId: string, toStatus: ExceptionStatus, note?: string) {
-    await withBusy(async () => {
-      await api.patch(`/exceptions/${exceptionCaseId}/transition`, { toStatus, note });
-      await refreshAll();
-      toast.success(`Exception moved to ${toStatus.replace(/_/g, " ").toLowerCase()}`);
-    });
-  }
-
-  async function runExceptionAutomationNow() {
-    await withBusy(async () => {
-      await api.post("/exceptions/automation/run", {});
-      await refreshAll();
-      toast.success("Exception automation completed");
-    });
-  }
-
-  async function updateCollege(collegeId: string, payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.put(`/admin/colleges/${collegeId}`, payload);
-      await refreshAll();
-      toast.success("College updated");
-    });
-  }
-
-  async function deleteCollege(collegeId: string) {
-    await withBusy(async () => {
-      await api.delete(`/admin/colleges/${collegeId}`);
-      await refreshAll();
-      toast.success("College deleted");
-    });
-  }
-
-  async function addCourse(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/admin/courses", payload);
-      await refreshAll();
-      toast.success("Course created");
-    });
-  }
-
-  async function updateCourse(courseId: string, payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.put(`/admin/courses/${courseId}`, payload);
-      await refreshAll();
-      toast.success("Course updated");
-    });
-  }
-
-  async function deleteCourse(courseId: string) {
-    await withBusy(async () => {
-      await api.delete(`/admin/courses/${courseId}`);
-      await refreshAll();
-      toast.success("Course deleted");
-    });
-  }
-
-  async function addSession(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/admin/sessions", payload);
-      await refreshAll();
-      toast.success("Session added");
-    });
-  }
-
-  async function updateSession(sessionId: string, payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.put(`/admin/sessions/${sessionId}`, payload);
-      await refreshAll();
-      toast.success("Session updated");
-    });
-  }
-
-  async function deleteSession(sessionId: string) {
-    await withBusy(async () => {
-      await api.delete(`/admin/sessions/${sessionId}`);
-      await refreshAll();
-      toast.success("Session deleted");
-    });
-  }
-
-  async function addSubject(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/admin/subjects", payload);
-      await refreshAll();
-      toast.success("Subject added");
-    });
-  }
-
-  async function updateSubject(subjectId: string, payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.put(`/admin/subjects/${subjectId}`, payload);
-      await refreshAll();
-      toast.success("Subject updated");
-    });
-  }
-
-  async function deleteSubject(subjectId: string) {
-    await withBusy(async () => {
-      await api.delete(`/admin/subjects/${subjectId}`);
-      await refreshAll();
-      toast.success("Subject deleted");
-    });
-  }
-
-  async function addCustomRole(payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.post("/admin/custom-roles", payload);
-      await refreshAll();
-      toast.success("Custom role created");
-    });
-  }
-
-  async function updateCustomRole(roleId: string, payload: Record<string, unknown>) {
-    await withBusy(async () => {
-      await api.patch(`/admin/custom-roles/${roleId}`, payload);
-      await refreshAll();
-      toast.success("Custom role updated");
-    });
-  }
-
-  async function deleteCustomRole(roleId: string) {
-    await withBusy(async () => {
-      await api.delete(`/admin/custom-roles/${roleId}`);
-      await refreshAll();
-      toast.success("Custom role deleted");
-    });
   }
 
   if (!user) {
     return (
       <>
-        <LoginForm onSuccess={handleLogin} />
+        <LoginForm onSuccess={login} />
         <Toaster richColors position="top-right" closeButton />
       </>
     );
@@ -1080,7 +348,7 @@ export default function App() {
               </div>
               {!sidebarCollapsed && (
                 <div>
-                  <p className="text-sm font-semibold">{settingsSnapshot?.trust?.name ?? "CampusGrid"}</p>
+                  <p className="text-sm font-semibold">{settingsData?.trust?.name ?? "CampusGrid"}</p>
                   <p className="text-xs text-slate-500">Application Shell</p>
                 </div>
               )}
@@ -1164,9 +432,9 @@ export default function App() {
               <div className="flex items-center gap-4">
                 <div
                   className="max-w-[320px] truncate rounded-2xl border border-slate-200 bg-slate-50 px-3 py-2 text-sm font-semibold text-slate-700"
-                  title={settingsSnapshot?.trust?.name ?? "CampusGrid ERP"}
+                  title={settingsData?.trust?.name ?? "CampusGrid ERP"}
                 >
-                  {settingsSnapshot?.trust?.name ?? "CampusGrid ERP"}
+                  {settingsData?.trust?.name ?? "CampusGrid ERP"}
                 </div>
 
                 <div className="relative">
@@ -1273,7 +541,7 @@ export default function App() {
                             type="button"
                             className="text-xs font-medium text-slate-600 hover:text-slate-900"
                             onClick={() => {
-                              void markAllNotificationsRead();
+                              void markAllReadMutation.mutateAsync();
                             }}
                           >
                             Mark all read
@@ -1344,7 +612,7 @@ export default function App() {
                               setActiveNav("settings");
                             }
                             if (action === "logout") {
-                              logout();
+                              authLogout();
                             }
                           }}
                         >
@@ -1359,8 +627,6 @@ export default function App() {
           </header>
 
           <main className="flex-1 px-6 py-6">
-            {busy && <div className="mb-4 rounded-2xl bg-blue-50 px-4 py-2 text-sm text-blue-700">Saving changes...</div>}
-
             <AnimatePresence mode="wait">
               <motion.div
                 key={activeNav}
@@ -1371,153 +637,35 @@ export default function App() {
               >
                 <Suspense fallback={<WorkspaceLoadingState nav={activeNav} />}>
                   {activeNav === "dashboard" && (
-                    <DashboardPage
-                      colleges={colleges}
-                      students={students}
-                      staff={staff}
-                      attendanceRows={attendanceRows}
-                      leaveRows={leaveRows}
-                      payrollRows={payrollRows}
-                      ledger={ledger}
-                      workflowInbox={workflowInbox}
-                      dashboardSummary={dashboardSummary}
-                      onRunAdmissionAction={updateAdmissionWorkflowStatus}
-                      onUpdateLeaveStatus={updateLeaveStatus}
-                      dashboardFilters={dashboardFilters}
-                      onChangeDashboardFilters={updateDashboardFilters}
-                      loading={busy}
-                      onNavigate={setActiveNav}
-                    />
+                    <DashboardPage onNavigate={setActiveNav} />
                   )}
 
                   {activeNav === "students" && (
-                    <StudentsPage
-                      colleges={colleges}
-                      students={students}
-                      trustName={settingsSnapshot?.trust?.name}
-                      onCreateAdmission={submitAdmission}
-                      onDeleteStudent={deleteStudent}
-                      onRefreshStudents={refreshAll}
-                      loading={busy}
-                      permissions={permissions}
-                    />
+                    <StudentsPage />
                   )}
 
                   {activeNav === "finance" && (
-                    <FinancePage
-                      ledger={ledger}
-                      colleges={colleges}
-                      students={students}
-                      trustName={settingsSnapshot?.trust?.name}
-                      expenses={expenseReport}
-                      duesReport={duesReport}
-                      receivablesAging={receivablesAging}
-                      currentUserEmail={user?.email}
-                      currentUserRole={user?.role}
-                      permissions={permissions}
-                      onCollectFee={collectFee}
-                      onSaveDraft={saveFeeDraft}
-                      onConfirmDraft={confirmFeeDraft}
-                      onRaiseException={raiseFeeException}
-                      onAddCredit={addMiscCredit}
-                      onAddExpense={addExpense}
-                      loading={busy}
-                    />
+                    <FinancePage />
                   )}
 
                   {activeNav === "hr" && (
-                    <HrPage
-                      colleges={colleges}
-                      staff={staff}
-                      salaryConfigs={salaryConfigs}
-                      customRoles={customRoles}
-                      attendanceRows={attendanceRows}
-                      leaveRows={leaveRows}
-                      payrollRows={payrollRows}
-                      onAddStaff={addStaff}
-                      onProcessPayroll={processPayroll}
-                      onUpdateStaff={updateStaff}
-                      onDeleteStaff={deleteStaff}
-                      onUpdateLeaveStatus={updateLeaveStatus}
-                      onSaveSalaryConfig={saveSalaryConfig}
-                      onUpdatePayrollStatus={updatePayrollStatus}
-                      loading={busy}
-                      permissions={permissions}
-                    />
+                    <HrPage />
                   )}
 
                   {activeNav === "exceptions" && (
-                    <ExceptionsPage
-                      exceptions={exceptions}
-                      metrics={exceptionMetrics}
-                      permissions={permissions}
-                      loading={busy}
-                      onTransition={transitionExceptionStatus}
-                      onRunAutomation={runExceptionAutomationNow}
-                      onRefresh={refreshAll}
-                    />
+                    <ExceptionsPage />
                   )}
 
-                  {activeNav === "exam" && (
-                    <ExamPage
-                      colleges={colleges}
-                      permissions={permissions}
-                      loading={busy}
-                    />
-                  )}
+                  {activeNav === "exam" && <ExamPage />}
 
-                  {activeNav === "hostel" && (
-                    <HostelPage
-                      colleges={colleges}
-                      students={students}
-                      permissions={permissions}
-                      loading={busy}
-                    />
-                  )}
+                  {activeNav === "hostel" && <HostelPage />}
 
-                  {activeNav === "library" && (
-                    <LibraryPage
-                      colleges={colleges}
-                      students={students}
-                      permissions={permissions}
-                      loading={busy}
-                    />
-                  )}
+                  {activeNav === "library" && <LibraryPage />}
 
-                  {activeNav === "transport" && (
-                    <TransportPage
-                      colleges={colleges}
-                      students={students}
-                      permissions={permissions}
-                      loading={busy}
-                    />
-                  )}
+                  {activeNav === "transport" && <TransportPage />}
 
                   {(activeNav === "admin" || activeNav === "settings") && (
-                    <EnterpriseAdminSettingsPanel
-                      activeNav={activeNav}
-                      colleges={colleges}
-                      loginAccounts={loginAccounts}
-                      customRoles={customRoles}
-                      settingsSnapshot={settingsSnapshot}
-                      loading={busy}
-                      onAddCollege={addCollege}
-                      onUpdateCollege={updateCollege}
-                      onDeleteCollege={deleteCollege}
-                      onAddCourse={addCourse}
-                      onUpdateCourse={updateCourse}
-                      onDeleteCourse={deleteCourse}
-                      onAddSession={addSession}
-                      onUpdateSession={updateSession}
-                      onDeleteSession={deleteSession}
-                      onAddSubject={addSubject}
-                      onUpdateSubject={updateSubject}
-                      onDeleteSubject={deleteSubject}
-                      onAddCustomRole={addCustomRole}
-                      onUpdateCustomRole={updateCustomRole}
-                      onDeleteCustomRole={deleteCustomRole}
-                      onUpdateSettings={updateSettings}
-                    />
+                    <EnterpriseAdminSettingsPanel activeNav={activeNav} />
                   )}
                 </Suspense>
               </motion.div>
@@ -1591,56 +739,50 @@ function WorkspaceLoadingState({ nav }: { nav: NavKey }) {
   );
 }
 
-function EnterpriseAdminSettingsPanel({
-  activeNav,
-  colleges,
-  loginAccounts,
-  customRoles,
-  settingsSnapshot,
-  loading,
-  onAddCollege,
-  onUpdateCollege,
-  onDeleteCollege,
-  onAddCourse,
-  onUpdateCourse,
-  onDeleteCourse,
-  onAddSession,
-  onUpdateSession,
-  onDeleteSession,
-  onAddSubject,
-  onUpdateSubject,
-  onDeleteSubject,
-  onAddCustomRole,
-  onUpdateCustomRole,
-  onDeleteCustomRole,
-  onUpdateSettings,
-}: {
-  activeNav: NavKey;
-  colleges: College[];
-  loginAccounts: LoginAccount[];
-  customRoles: CustomRole[];
-  settingsSnapshot: SettingsSnapshot | null;
-  loading: boolean;
-  onAddCollege: (payload: Record<string, unknown>) => Promise<void>;
-  onUpdateCollege: (collegeId: string, payload: Record<string, unknown>) => Promise<void>;
-  onDeleteCollege: (collegeId: string) => Promise<void>;
-  onAddCourse: (payload: Record<string, unknown>) => Promise<void>;
-  onUpdateCourse: (courseId: string, payload: Record<string, unknown>) => Promise<void>;
-  onDeleteCourse: (courseId: string) => Promise<void>;
-  onAddSession: (payload: Record<string, unknown>) => Promise<void>;
-  onUpdateSession: (sessionId: string, payload: Record<string, unknown>) => Promise<void>;
-  onDeleteSession: (sessionId: string) => Promise<void>;
-  onAddSubject: (payload: Record<string, unknown>) => Promise<void>;
-  onUpdateSubject: (subjectId: string, payload: Record<string, unknown>) => Promise<void>;
-  onDeleteSubject: (subjectId: string) => Promise<void>;
-  onAddCustomRole: (payload: Record<string, unknown>) => Promise<void>;
-  onUpdateCustomRole: (roleId: string, payload: Record<string, unknown>) => Promise<void>;
-  onDeleteCustomRole: (roleId: string) => Promise<void>;
-  onUpdateSettings: (payload: {
+function EnterpriseAdminSettingsPanel({ activeNav }: { activeNav: NavKey }) {
+  const { data: academicStructure = [], isFetching: loading } = useAcademicStructure();
+  const colleges: College[] = academicStructure;
+  const { data: loginAccounts = [] } = useUsers();
+  const { data: customRoles = [] } = useCustomRoles();
+  const { data: settingsSnapshot = null } = useSettings();
+
+  const createCollegeMutation = useCreateCollege();
+  const updateCollegeMutation = useUpdateCollege();
+  const deleteCollegeMutation = useDeleteCollege();
+  const createCourseMutation = useCreateCourse();
+  const updateCourseMutation = useUpdateCourse();
+  const deleteCourseMutation = useDeleteCourse();
+  const createSessionMutation = useCreateSession();
+  const updateSessionMutation = useUpdateSession();
+  const deleteSessionMutation = useDeleteSession();
+  const createSubjectMutation = useCreateSubject();
+  const updateSubjectMutation = useUpdateSubject();
+  const deleteSubjectMutation = useDeleteSubject();
+  const createCustomRoleMutation = useCreateCustomRole();
+  const updateCustomRoleMutation = useUpdateCustomRole();
+  const deleteCustomRoleMutation = useDeleteCustomRole();
+  const updateSettingsMutation = useUpdateSettings();
+
+  const onAddCollege = (payload: Record<string, unknown>) => createCollegeMutation.mutateAsync(payload).then(() => undefined);
+  const onUpdateCollege = (id: string, payload: Record<string, unknown>) => updateCollegeMutation.mutateAsync({ id, data: payload }).then(() => undefined);
+  const onDeleteCollege = (id: string) => deleteCollegeMutation.mutateAsync(id).then(() => undefined);
+  const onAddCourse = (payload: Record<string, unknown>) => createCourseMutation.mutateAsync(payload).then(() => undefined);
+  const onUpdateCourse = (id: string, payload: Record<string, unknown>) => updateCourseMutation.mutateAsync({ id, data: payload }).then(() => undefined);
+  const onDeleteCourse = (id: string) => deleteCourseMutation.mutateAsync(id).then(() => undefined);
+  const onAddSession = (payload: Record<string, unknown>) => createSessionMutation.mutateAsync(payload).then(() => undefined);
+  const onUpdateSession = (id: string, payload: Record<string, unknown>) => updateSessionMutation.mutateAsync({ id, data: payload }).then(() => undefined);
+  const onDeleteSession = (id: string) => deleteSessionMutation.mutateAsync(id).then(() => undefined);
+  const onAddSubject = (payload: Record<string, unknown>) => createSubjectMutation.mutateAsync(payload).then(() => undefined);
+  const onUpdateSubject = (id: string, payload: Record<string, unknown>) => updateSubjectMutation.mutateAsync({ id, data: payload }).then(() => undefined);
+  const onDeleteSubject = (id: string) => deleteSubjectMutation.mutateAsync(id).then(() => undefined);
+  const onAddCustomRole = (payload: Record<string, unknown>) => createCustomRoleMutation.mutateAsync(payload).then(() => undefined);
+  const onUpdateCustomRole = (id: string, payload: Record<string, unknown>) => updateCustomRoleMutation.mutateAsync({ id, data: payload }).then(() => undefined);
+  const onDeleteCustomRole = (id: string) => deleteCustomRoleMutation.mutateAsync(id).then(() => undefined);
+  const onUpdateSettings = (payload: {
     localization: { timezone: string; currency: string; dateFormat: string };
     security: { authStandard: string; staffDefaultPasswordPolicy: string };
-  }) => Promise<void>;
-}) {
+  }) => updateSettingsMutation.mutateAsync(payload).then(() => undefined);
+
   const isAdmin = activeNav === "admin";
 
   type ModalType = "college" | "editCollege" | "course" | "editCourse" | "session" | "editSession" | "subject" | "editSubject" | "customRole" | "editCustomRole" | null;

@@ -1,4 +1,12 @@
+import { FeeCollectionWorkflow } from "../../components/fee-collection/FeeCollectionWorkflow";
 import { FormEvent, useEffect, useMemo, useState, type ComponentType } from "react";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useStudents } from "../../hooks/useStudents";
+import { useSettings } from "../../hooks/useSettings";
+import { useLedger } from "../../hooks/useFinanceLedger";
+import { useDuesFines, useReceivablesAging, useExpenseReport } from "../../hooks/useReports";
+import { useCollectFee, useSaveFeeDraft, useConfirmFeeDraft, useRaiseFeeException, useAddMiscCredit, useCreateExpense } from "../../hooks/useFinance";
 import {
   AlertTriangle,
   BadgeCheck,
@@ -226,51 +234,54 @@ type Ledger = {
   closingBalance: number;
 } | null;
 
-type Props = {
-  ledger: Ledger;
-  colleges: College[];
-  students: Student[];
-  trustName?: string;
-  expenses: Expense[];
-  duesReport: Dues[];
-  receivablesAging: {
-    buckets: Array<{ label: string; count: number; amount: number }>;
-    defaulters: Array<{ studentId: string; admissionNumber: number; admissionCode?: string; candidateName: string; due: number; daysOutstanding: number }>;
-  };
-  loading: boolean;
-  currentUserEmail?: string;
-  currentUserRole?: "SUPER_ADMIN" | "STAFF";
-  permissions: string[];
-  onCollectFee: (payload: Record<string, unknown>) => Promise<{ receiptNumber?: string } | undefined>;
-  onSaveDraft: (payload: Record<string, unknown>) => Promise<{ id?: string } | undefined>;
-  onConfirmDraft: (draftId: string) => Promise<void>;
-  onRaiseException: (payload: Record<string, unknown>) => Promise<{ id?: string } | undefined>;
-  onAddCredit: (payload: Record<string, unknown>) => Promise<void>;
-  onAddExpense: (payload: Record<string, unknown>) => Promise<void>;
-};
 
 type FinanceSubmodule = "fee-collection" | "receivables" | "credits-adjustments" | "expenses" | "ledger-receipts";
 type DueCycle = string;
 type LedgerTab = "receipts" | "demand" | "adjustments" | "audit";
 
-export function FinancePage({
-  ledger,
-  colleges,
-  students,
-  trustName,
-  expenses,
-  duesReport,
-  receivablesAging,
-  loading,
-  currentUserEmail,
-  permissions,
-  onCollectFee,
-  onSaveDraft,
-  onConfirmDraft,
-  onRaiseException,
-  onAddCredit,
-  onAddExpense,
-}: Props) {
+export function FinancePage() {
+  const { user, permissions } = useAuth();
+  const currentUserEmail = user?.email;
+
+  const { data: academicStructure = [] } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({
+    id: c.id,
+    name: c.name,
+    courses: c.courses.map((course) => ({
+      id: course.id,
+      name: course.name,
+      sessions: course.sessions.map((s) => ({ id: s.id, label: s.label, startYear: s.startYear ?? 0, endYear: s.endYear ?? 0, sessionFee: s.sessionFee })),
+    })),
+  }));
+  const { data: studentsPayload, isFetching: loading } = useStudents();
+  const students: Student[] = Array.isArray(studentsPayload) ? studentsPayload : (studentsPayload?.data ?? []);
+  const { data: settingsData } = useSettings();
+  const trustName = settingsData?.trust?.name;
+  const { data: ledger = null } = useLedger({ period: "monthly" });
+  const { data: duesReport = [] } = useDuesFines();
+  const { data: receivablesAging = { buckets: [], defaulters: [] } } = useReceivablesAging();
+  const { data: expenseReport } = useExpenseReport();
+  const expenses: Expense[] = (expenseReport ?? []) as unknown as Expense[];
+
+  const collectFeeMutation = useCollectFee();
+  const saveDraftMutation = useSaveFeeDraft();
+  const confirmDraftMutation = useConfirmFeeDraft();
+  const raiseExceptionMutation = useRaiseFeeException();
+  const addCreditMutation = useAddMiscCredit();
+  const createExpenseMutation = useCreateExpense();
+
+  const onCollectFee = (payload: Record<string, unknown>) =>
+    collectFeeMutation.mutateAsync(payload).then((r) => r as { receiptNumber?: string } | undefined);
+  const onSaveDraft = (payload: Record<string, unknown>) =>
+    saveDraftMutation.mutateAsync(payload).then((r) => r as { id?: string } | undefined);
+  const onConfirmDraft = (draftId: string) =>
+    confirmDraftMutation.mutateAsync(draftId).then(() => undefined);
+  const onRaiseException = (payload: Record<string, unknown>) =>
+    raiseExceptionMutation.mutateAsync(payload).then((r) => r as { id?: string } | undefined);
+  const onAddCredit = (payload: Record<string, unknown>) =>
+    addCreditMutation.mutateAsync(payload).then(() => undefined);
+  const onAddExpense = (payload: Record<string, unknown>) =>
+    createExpenseMutation.mutateAsync(payload).then(() => undefined);
   const [activeModule, setActiveModule] = useState<FinanceSubmodule>("fee-collection");
   const [studentQuery, setStudentQuery] = useState("");
   const [selectedStudentId, setSelectedStudentId] = useState("");
@@ -893,6 +904,13 @@ export function FinancePage({
             <CardStat title="Today Pending" value={formatCurrency(todayPending)} icon={Landmark} />
           </div>
 
+          <FeeCollectionWorkflow
+            trustName={trustName}
+            canCollect={canCollect}
+          />
+
+          {/* ── legacy panels kept for reference, hidden ── */}
+          <div className="hidden">
           <div className="grid gap-4 xl:grid-cols-[1.8fr_1fr]">
             <div className="space-y-4">
               <section className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
@@ -1302,6 +1320,7 @@ export function FinancePage({
               </section>
             </div>
           </div>
+          </div>{/* end hidden legacy */}
         </>
       )}
 
@@ -1861,7 +1880,7 @@ function ExpenseManagement({
         api.get<ExpenseBudget[]>("/finance/budgets", { params: { ...params, financialYear: currentFY } }),
         api.get<ExpenseRecurring[]>("/finance/recurring-expenses", { params }),
         api.get<PettyCashEntry[]>("/finance/petty-cash", { params }),
-        api.get<Expense[]>("/finance/expenses", { params: expenseParams }),
+        api.get<{ data: Expense[]; hasMore: boolean; nextCursor?: string }>("/finance/expenses", { params: expenseParams }),
         api.get<ExpenseReportResponse>("/finance/expenses/reports", { params: reportsParams }),
         api.get<ExpenseAuditLog[]>("/finance/expenses/audit-logs", { params: auditParams }),
       ]);
@@ -1869,7 +1888,7 @@ function ExpenseManagement({
       setBudgets(budgetsRes.data);
       setRecurring(recurringRes.data);
       setPettyCash(pettyCashRes.data);
-      setDetailExpenses(expensesRes.data);
+      setDetailExpenses(expensesRes.data.data ?? []);
       setReportData(reportsRes.data);
       setAuditLogs(auditRes.data);
     } catch {

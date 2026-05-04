@@ -3,6 +3,8 @@ import { CalendarDays, Plus, ClipboardList, BookOpen, CheckCircle2, XCircle, Pen
 import { toast } from "sonner";
 import { api } from "../../services/api";
 import { hasPermission } from "../../lib/permissions";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
 
 type College = { id: string; name: string; courses: Array<{ id: string; name: string; sessions: Array<{ id: string; label: string }> }> };
 
@@ -30,11 +32,6 @@ export type ExamSchedule = {
   }>;
 };
 
-type Props = {
-  colleges: College[];
-  permissions: string[];
-  loading: boolean;
-};
 
 const EXAM_TYPES = ["INTERNAL", "EXTERNAL", "PRACTICAL", "VIVA"] as const;
 const EXAM_TYPE_LABELS: Record<string, string> = {
@@ -44,7 +41,14 @@ const EXAM_TYPE_LABELS: Record<string, string> = {
   VIVA: "Viva",
 };
 
-export default function ExamPage({ colleges, permissions, loading }: Props) {
+export default function ExamPage() {
+  const { permissions } = useAuth();
+  const { data: academicStructure = [], isFetching: loading } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({
+    id: c.id,
+    name: c.name,
+    courses: c.courses.map((course) => ({ id: course.id, name: course.name, sessions: course.sessions.map((s) => ({ id: s.id, label: s.label })) })),
+  }));
   const canWrite = hasPermission(permissions, "EXAM_WRITE");
 
   const [schedules, setSchedules] = useState<ExamSchedule[]>([]);

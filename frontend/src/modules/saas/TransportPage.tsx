@@ -3,6 +3,9 @@ import { Bus, Plus, MapPin, Users, Pencil, UserCheck } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "../../services/api";
 import { hasPermission } from "../../lib/permissions";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useStudents } from "../../hooks/useStudents";
 
 type College = { id: string; name: string };
 type Student = { id: string; candidateName: string; admissionNumber: number };
@@ -37,19 +40,18 @@ export type TransportAllocation = {
   student: { id: string; candidateName: string; admissionNumber: number };
 };
 
-type Props = {
-  colleges: College[];
-  students: Student[];
-  permissions: string[];
-  loading: boolean;
-};
 
 const STATUS_STYLES: Record<string, string> = {
   ACTIVE: "bg-emerald-900/40 text-emerald-300",
   INACTIVE: "bg-slate-700/60 text-slate-400",
 };
 
-export default function TransportPage({ colleges, students, permissions, loading }: Props) {
+export default function TransportPage() {
+  const { permissions } = useAuth();
+  const { data: academicStructure = [], isFetching: loading } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({ id: c.id, name: c.name }));
+  const { data: studentsPayload } = useStudents();
+  const students: Student[] = (Array.isArray(studentsPayload) ? studentsPayload : (studentsPayload?.data ?? [])).map((s) => ({ id: s.id, candidateName: s.candidateName, admissionNumber: s.admissionNumber }));
   const canWrite = hasPermission(permissions, "TRANSPORT_WRITE");
 
   const [routes, setRoutes] = useState<TransportRoute[]>([]);

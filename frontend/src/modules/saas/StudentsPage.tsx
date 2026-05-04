@@ -5,6 +5,12 @@ import { toast } from "sonner";
 import { hasPermission } from "../../lib/permissions";
 import { exportRowsToCsv, loadSavedPresets, removeSavedPreset, type SavedPreset, upsertSavedPreset } from "../../lib/viewPresets";
 import { api } from "../../services/api";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useStudents, useSubmitAdmission, useDeleteStudent, STUDENTS_KEY } from "../../hooks/useStudents";
+import { useSettings } from "../../hooks/useSettings";
+import { useQueryClient } from "@tanstack/react-query";
+import { StudentProfilePage } from "./StudentProfilePage";
 
 type College = {
   id: string;
@@ -24,7 +30,7 @@ type Student = {
   status: string;
   totalPayable: number;
   collegeId: string;
-  admissions?: Array<{ courseId: string; sessionId: string; createdAt?: string }>;
+  admissions?: Array<{ id: string; courseId: string; sessionId: string; createdAt?: string }>;
 };
 
 type StudentFilterPresetValues = {
@@ -51,16 +57,6 @@ type SubmittedAdmissionData = {
   submittedAt: string;
 };
 
-type Props = {
-  colleges: College[];
-  students: Student[];
-  trustName?: string;
-  loading: boolean;
-  permissions: string[];
-  onCreateAdmission: (payload: Record<string, unknown>) => Promise<{ id: string; admissionNumber: number; admissionCode?: string; candidateName: string } | void>;
-  onDeleteStudent: (studentId: string) => Promise<void>;
-  onRefreshStudents: () => Promise<void>;
-};
 
 type WizardStep = 1 | 2 | 3 | 4 | 5 | 6;
 type DetailTab = "complete" | "fees" | "documents" | "audit";
@@ -192,7 +188,36 @@ type StudentEditForm = {
   universityRegistrationNumber: string;
 };
 
-export function StudentsPage({ colleges, students, loading, permissions, onCreateAdmission, onDeleteStudent, onRefreshStudents }: Props) {
+export function StudentsPage() {
+  const { permissions } = useAuth();
+  const qc = useQueryClient();
+  const { data: academicStructure = [] } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({
+    id: c.id,
+    name: c.name,
+    courses: c.courses.map((course) => ({
+      id: course.id,
+      name: course.name,
+      sessions: course.sessions.map((s) => ({ id: s.id, label: s.label, seatCount: s.seatCount, sessionFee: s.sessionFee })),
+    })),
+  }));
+  const { data: studentsPayload, isFetching: loading } = useStudents();
+  const students: Student[] = Array.isArray(studentsPayload) ? studentsPayload : (studentsPayload?.data ?? []);
+  const { data: settingsData } = useSettings();
+  const trustName = settingsData?.trust?.name;
+
+  const submitAdmissionMutation = useSubmitAdmission();
+  const deleteStudentMutation = useDeleteStudent();
+
+  const onCreateAdmission = (payload: Record<string, unknown>) =>
+    submitAdmissionMutation.mutateAsync(payload).then((r) => r.student);
+
+  const onDeleteStudent = (studentId: string) =>
+    deleteStudentMutation.mutateAsync(studentId).then(() => undefined);
+
+  const onRefreshStudents = () =>
+    qc.invalidateQueries({ queryKey: STUDENTS_KEY }).then(() => undefined);
+
   const canCreateAdmission = hasPermission(permissions, "STUDENTS_WRITE");
   const canManageWorkflow = hasPermission(permissions, "ADMISSIONS_APPROVE");
 
@@ -1273,210 +1298,22 @@ export function StudentsPage({ colleges, students, loading, permissions, onCreat
         </div>
       </div>
 
-      {profileMode !== "directory" && selectedStudent && (
-        <div className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
-          <div className="flex flex-wrap items-start justify-between gap-3 border-b border-slate-100 pb-4">
-            <div>
-              <p className="text-xs uppercase tracking-wide text-slate-400">Student Profile</p>
-              <h2 className="mt-1 text-xl font-semibold text-slate-900">
-                {profileMode === "edit" ? "Edit Student Profile" : "Full Student Profile"}
-              </h2>
-              <p className="mt-1 text-sm text-slate-500">
-                {selectedStudent.candidateName} · Admission {selectedStudent.admissionCode ?? `#${selectedStudent.admissionNumber}`}
-              </p>
-            </div>
-            <div className="flex flex-wrap gap-2">
-              <button
-                type="button"
-                className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-medium text-slate-700"
-                onClick={() => setProfileMode("directory")}
-              >
-                Back to Directory
-              </button>
-              {profileMode === "view" && (
-                <button
-                  type="button"
-                  className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white"
-                  onClick={() => setProfileMode("edit")}
-                >
-                  Edit Profile
-                </button>
-              )}
-              {profileMode === "edit" && (
-                <>
-                  <button
-                    type="button"
-                    className="rounded-xl border border-rose-200 bg-rose-50 px-3 py-2 text-sm font-medium text-rose-700"
-                    onClick={() => void removeStudent()}
-                  >
-                    Delete Student
-                  </button>
-                  <button
-                    type="button"
-                    className="rounded-xl bg-emerald-600 px-3 py-2 text-sm font-medium text-white disabled:opacity-60"
-                    onClick={() => void saveProfileEdits()}
-                    disabled={editProfileSaving}
-                  >
-                    {editProfileSaving ? "Saving..." : "Save Changes"}
-                  </button>
-                </>
-              )}
-            </div>
-          </div>
-
-          {profileMode === "view" && (
-            <div className="mt-5 grid gap-4 xl:grid-cols-2">
-              <DetailSection title="Personal Details" description="Core student and guardian identity data.">
-                <DetailRow label="Student" value={selectedStudent.candidateName} />
-                <DetailRow label="Father Name" value={studentProfileData?.student.fatherName ?? "Not available"} />
-                <DetailRow label="Mother Name" value={studentProfileData?.student.motherName ?? "Not available"} />
-                <DetailRow label="DOB" value={studentProfileData?.student.dob ? new Date(studentProfileData.student.dob).toLocaleDateString() : "Not available"} />
-                <DetailRow label="Gender" value={studentProfileData?.student.gender ?? "Not available"} />
-                <DetailRow label="Nationality" value={studentProfileData?.student.nationality ?? "Not available"} />
-                <DetailRow label="Mobile" value={studentProfileData?.student.mobile ?? "Not available"} />
-                <DetailRow label="Email" value={studentProfileData?.student.email ?? "Not available"} />
-              </DetailSection>
-
-              <DetailSection title="Academic Details" description="Course, session, roll, and status mapping.">
-                <DetailRow label="Admission Number" value={selectedStudent.admissionCode ?? `#${selectedStudent.admissionNumber}`} />
-                <DetailRow label="Roll Number" value={studentProfileData?.student.rollCode ?? String(studentProfileData?.student.rollNumber ?? "Not generated")} />
-                <DetailRow label="College" value={collegeById[selectedStudent.collegeId]?.name ?? "Trust"} />
-                <DetailRow label="Course" value={selectedAdmissionDetails?.course?.name ?? "Not mapped"} />
-                <DetailRow label="Session" value={selectedAdmissionDetails?.session?.label ?? "Not mapped"} />
-                <DetailRow label="Status" value={selectedStudent.status} />
-              </DetailSection>
-
-              <DetailSection title="Documents" description="Uploaded and available supporting files.">
-                <DetailRow label="Available Docs" value={(studentProfileData?.availableDocuments ?? []).join(", ") || "No documents listed"} />
-                <DetailRow label="Document Verification" value={documentsVerified ? "Verified" : "Pending"} />
-                <DetailRow label="Latest Note" value={workflowData?.workflow.notes ?? "No note"} />
-              </DetailSection>
-
-              <DetailSection title="Finance" description="Fee and receipt snapshot.">
-                <DetailRow label="Total Payable" value={`INR ${selectedStudent.totalPayable.toLocaleString()}`} />
-                <DetailRow label="Receipts" value={String(historyData?.receipts.length ?? 0)} />
-                <DetailRow label="Latest Receipt" value={historyData?.receipts[0]?.receiptNumber ?? "No stored receipt"} />
-              </DetailSection>
-
-              <DetailSection title="Attendance & Activity" description="Most recent timeline events.">
-                <div className="max-h-72 space-y-2 overflow-auto pr-1">
-                  {recentTimeline.slice(0, 10).map((entry) => (
-                    <div key={entry.id} className="rounded-xl bg-white px-3 py-2 ring-1 ring-slate-100">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="text-sm font-medium text-slate-800">{entry.title}</p>
-                        <span className="text-xs text-slate-400">{new Date(entry.createdAt).toLocaleString()}</span>
-                      </div>
-                      <p className="mt-1 text-xs text-slate-600">{entry.details}</p>
-                    </div>
-                  ))}
-                  {recentTimeline.length === 0 && <p className="text-sm text-slate-500">No timeline records available.</p>}
-                </div>
-              </DetailSection>
-
-              <DetailSection title="Audit Logs" description="Recent audit and workflow actions.">
-                <div className="max-h-72 space-y-2 overflow-auto pr-1">
-                  {(historyData?.audit ?? []).slice(0, 10).map((item) => (
-                    <div key={item.id} className="rounded-xl bg-white px-3 py-2 ring-1 ring-slate-100">
-                      <div className="flex items-center justify-between gap-3">
-                        <p className="text-sm font-medium text-slate-800">{item.action.replace(/_/g, " ")}</p>
-                        <span className="text-xs text-slate-400">{new Date(item.createdAt).toLocaleString()}</span>
-                      </div>
-                      <p className="mt-1 text-xs text-slate-600">{item.entityType}</p>
-                    </div>
-                  ))}
-                  {(historyData?.audit.length ?? 0) === 0 && <p className="text-sm text-slate-500">No audit records available.</p>}
-                </div>
-              </DetailSection>
-            </div>
-          )}
-
-          {profileMode === "edit" && (
-            <div className="mt-5 grid gap-4 md:grid-cols-2">
-              <label className="text-sm text-slate-600">
-                Candidate Name
-                <input
-                  value={editProfileForm.candidateName}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, candidateName: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                Father Name
-                <input
-                  value={editProfileForm.fatherName}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, fatherName: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                Mother Name
-                <input
-                  value={editProfileForm.motherName}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, motherName: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                Mobile
-                <input
-                  value={editProfileForm.mobile}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, mobile: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                Guardian Mobile
-                <input
-                  value={editProfileForm.fatherMobile}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, fatherMobile: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                Email
-                <input
-                  value={editProfileForm.email}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, email: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600 md:col-span-2">
-                Permanent Address
-                <textarea
-                  value={editProfileForm.permanentAddress}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, permanentAddress: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                  rows={2}
-                />
-              </label>
-              <label className="text-sm text-slate-600 md:col-span-2">
-                Mailing Address
-                <textarea
-                  value={editProfileForm.mailingAddress}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, mailingAddress: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                  rows={2}
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                University Enrollment Number
-                <input
-                  value={editProfileForm.universityEnrollmentNumber}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, universityEnrollmentNumber: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-              <label className="text-sm text-slate-600">
-                University Registration Number
-                <input
-                  value={editProfileForm.universityRegistrationNumber}
-                  onChange={(event) => setEditProfileForm((prev) => ({ ...prev, universityRegistrationNumber: event.target.value }))}
-                  className="mt-1 w-full rounded-xl border border-slate-200 bg-white px-3 py-2 text-sm"
-                />
-              </label>
-            </div>
-          )}
-        </div>
+      {profileMode !== "directory" && selectedStudent && selectedStudentId && (
+        <StudentProfilePage
+          studentId={selectedStudentId}
+          student={selectedStudent}
+          colleges={colleges}
+          canEdit={canCreateAdmission}
+          canManageWorkflow={canManageWorkflow}
+          onBack={() => setProfileMode("directory")}
+          onDeleted={() => {
+            setSelectedStudentId(null);
+            setProfileMode("directory");
+          }}
+          onWorkflowAction={async (action) => {
+            await runWorkflowAction(action as Parameters<typeof runWorkflowAction>[0]);
+          }}
+        />
       )}
 
       {profileMode === "directory" && (
@@ -1618,17 +1455,10 @@ export function StudentsPage({ colleges, students, loading, permissions, onCreat
               <div className="mt-4 grid grid-cols-2 gap-2">
                 <button
                   type="button"
-                  className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white"
+                  className="col-span-2 rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white"
                   onClick={() => setProfileMode("view")}
                 >
                   View Profile
-                </button>
-                <button
-                  type="button"
-                  className="rounded-xl bg-slate-100 px-3 py-2 text-sm font-medium text-slate-700"
-                  onClick={() => setProfileMode("edit")}
-                >
-                  Edit Profile
                 </button>
               </div>
 
