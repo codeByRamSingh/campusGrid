@@ -1,4 +1,13 @@
+import { FeeCollectionWorkflow } from "../../components/fee-collection/FeeCollectionWorkflow";
+import { CashLedger } from "../../components/finance/CashLedger";
 import { FormEvent, useEffect, useMemo, useState, type ComponentType } from "react";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useStudents } from "../../hooks/useStudents";
+import { useSettings } from "../../hooks/useSettings";
+import { useLedger } from "../../hooks/useFinanceLedger";
+import { useDuesFines, useReceivablesAging, useExpenseReport } from "../../hooks/useReports";
+import { useCollectFee, useSaveFeeDraft, useConfirmFeeDraft, useRaiseFeeException, useAddMiscCredit, useCreateExpense } from "../../hooks/useFinance";
 import {
   AlertTriangle,
   BadgeCheck,
@@ -18,6 +27,7 @@ import { Bar, BarChart, CartesianGrid, Cell, Pie, PieChart, ResponsiveContainer,
 import { hasPermission } from "../../lib/permissions";
 import { exportRowsToCsv, loadSavedPresets, removeSavedPreset, type SavedPreset, upsertSavedPreset } from "../../lib/viewPresets";
 import { api } from "../../services/api";
+import { financeApi, type FinancialTransaction } from "../../services/financeApi";
 
 type College = {
   id: string;
@@ -226,51 +236,54 @@ type Ledger = {
   closingBalance: number;
 } | null;
 
-type Props = {
-  ledger: Ledger;
-  colleges: College[];
-  students: Student[];
-  trustName?: string;
-  expenses: Expense[];
-  duesReport: Dues[];
-  receivablesAging: {
-    buckets: Array<{ label: string; count: number; amount: number }>;
-    defaulters: Array<{ studentId: string; admissionNumber: number; admissionCode?: string; candidateName: string; due: number; daysOutstanding: number }>;
-  };
-  loading: boolean;
-  currentUserEmail?: string;
-  currentUserRole?: "SUPER_ADMIN" | "STAFF";
-  permissions: string[];
-  onCollectFee: (payload: Record<string, unknown>) => Promise<{ receiptNumber?: string } | undefined>;
-  onSaveDraft: (payload: Record<string, unknown>) => Promise<{ id?: string } | undefined>;
-  onConfirmDraft: (draftId: string) => Promise<void>;
-  onRaiseException: (payload: Record<string, unknown>) => Promise<{ id?: string } | undefined>;
-  onAddCredit: (payload: Record<string, unknown>) => Promise<void>;
-  onAddExpense: (payload: Record<string, unknown>) => Promise<void>;
-};
 
-type FinanceSubmodule = "fee-collection" | "receivables" | "credits-adjustments" | "expenses" | "ledger-receipts";
+type FinanceSubmodule = "fee-collection" | "receivables" | "credits-adjustments" | "expenses" | "cash-ledger";
 type DueCycle = string;
 type LedgerTab = "receipts" | "demand" | "adjustments" | "audit";
 
-export function FinancePage({
-  ledger,
-  colleges,
-  students,
-  trustName,
-  expenses,
-  duesReport,
-  receivablesAging,
-  loading,
-  currentUserEmail,
-  permissions,
-  onCollectFee,
-  onSaveDraft,
-  onConfirmDraft,
-  onRaiseException,
-  onAddCredit,
-  onAddExpense,
-}: Props) {
+export function FinancePage() {
+  const { user, permissions } = useAuth();
+  const currentUserEmail = user?.email;
+
+  const { data: academicStructure = [] } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({
+    id: c.id,
+    name: c.name,
+    courses: c.courses.map((course) => ({
+      id: course.id,
+      name: course.name,
+      sessions: course.sessions.map((s) => ({ id: s.id, label: s.label, startYear: s.startYear ?? 0, endYear: s.endYear ?? 0, sessionFee: s.sessionFee })),
+    })),
+  }));
+  const { data: studentsPayload, isFetching: loading } = useStudents();
+  const students: Student[] = Array.isArray(studentsPayload) ? studentsPayload : (studentsPayload?.data ?? []);
+  const { data: settingsData } = useSettings();
+  const trustName = settingsData?.trust?.name;
+  const { data: ledger = null } = useLedger({ period: "monthly" });
+  const { data: duesReport = [] } = useDuesFines();
+  const { data: receivablesAging = { buckets: [], defaulters: [] } } = useReceivablesAging();
+  const { data: expenseReport } = useExpenseReport();
+  const expenses: Expense[] = (expenseReport ?? []) as unknown as Expense[];
+
+  const collectFeeMutation = useCollectFee();
+  const saveDraftMutation = useSaveFeeDraft();
+  const confirmDraftMutation = useConfirmFeeDraft();
+  const raiseExceptionMutation = useRaiseFeeException();
+  const addCreditMutation = useAddMiscCredit();
+  const createExpenseMutation = useCreateExpense();
+
+  const onCollectFee = (payload: Record<string, unknown>) =>
+    collectFeeMutation.mutateAsync(payload).then((r) => r as { receiptNumber?: string } | undefined);
+  const onSaveDraft = (payload: Record<string, unknown>) =>
+    saveDraftMutation.mutateAsync(payload).then((r) => r as { id?: string } | undefined);
+  const onConfirmDraft = (draftId: string) =>
+    confirmDraftMutation.mutateAsync(draftId).then(() => undefined);
+  const onRaiseException = (payload: Record<string, unknown>) =>
+    raiseExceptionMutation.mutateAsync(payload).then((r) => r as { id?: string } | undefined);
+  const onAddCredit = (payload: Record<string, unknown>) =>
+    addCreditMutation.mutateAsync(payload).then(() => undefined);
+  const onAddExpense = (payload: Record<string, unknown>) =>
+    createExpenseMutation.mutateAsync(payload).then(() => undefined);
   const [activeModule, setActiveModule] = useState<FinanceSubmodule>("fee-collection");
   const [studentQuery, setStudentQuery] = useState("");
   const [selectedStudentId, setSelectedStudentId] = useState("");
@@ -316,6 +329,11 @@ export function FinancePage({
   const canAdjust = hasPermission(permissions, "FINANCE_APPROVE");
   const canApprove = hasPermission(permissions, "FINANCE_APPROVE");
   const canReverse = hasPermission(permissions, "FINANCE_APPROVE");
+
+  // ── Misc Credits transaction list state ────────────────────────────────────
+  const [miscTxns, setMiscTxns] = useState<FinancialTransaction[]>([]);
+  const [miscTxnsLoading, setMiscTxnsLoading] = useState(false);
+  const [miscCreditCollegeId, setMiscCreditCollegeId] = useState<string>("");
 
   const filteredStudents = useMemo(() => {
     const query = studentQuery.trim().toLowerCase();
@@ -813,13 +831,43 @@ export function FinancePage({
   async function submitCredit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const form = new FormData(event.currentTarget);
+    const collegeId = String(form.get("collegeId") ?? "");
     await onAddCredit({
-      collegeId: form.get("collegeId"),
+      collegeId,
       amount: Number(form.get("amount")),
       source: form.get("source"),
       notes: form.get("notes"),
     });
     event.currentTarget.reset();
+    // Reload transaction list after adding
+    if (collegeId) {
+      void loadMiscTxns(collegeId);
+    }
+  }
+
+  async function loadMiscTxns(collegeId: string) {
+    if (!collegeId) return;
+    setMiscTxnsLoading(true);
+    try {
+      const txns = await financeApi.getTransactions({ collegeId, source: "MISC", limit: 50 });
+      setMiscTxns(txns);
+    } catch {
+      // silent — table shows empty
+    } finally {
+      setMiscTxnsLoading(false);
+    }
+  }
+
+  async function handleReverseTransaction(id: string) {
+    if (!window.confirm("Reverse this transaction? A counter-entry will be created.")) return;
+    try {
+      await financeApi.reverseTransaction(id, "Manual reversal");
+      // Find the college from existing txns to reload
+      const txn = miscTxns.find((t) => t.id === id);
+      if (txn) void loadMiscTxns(txn.collegeId);
+    } catch {
+      alert("Could not reverse transaction. Please try again.");
+    }
   }
 
   async function submitExpense(event: FormEvent<HTMLFormElement>) {
@@ -872,7 +920,7 @@ export function FinancePage({
             ["receivables", "Receivables & Dues"],
             ["credits-adjustments", "Misc Credits & Adjustments"],
             ["expenses", "Expenses"],
-            ["ledger-receipts", "Ledger & Receipts"],
+            ["cash-ledger", "Cash Ledger"],
           ].map(([key, label]) => (
             <button
               key={key}
@@ -893,6 +941,13 @@ export function FinancePage({
             <CardStat title="Today Pending" value={formatCurrency(todayPending)} icon={Landmark} />
           </div>
 
+          <FeeCollectionWorkflow
+            trustName={trustName}
+            canCollect={canCollect}
+          />
+
+          {/* ── legacy panels kept for reference, hidden ── */}
+          <div className="hidden">
           <div className="grid gap-4 xl:grid-cols-[1.8fr_1fr]">
             <div className="space-y-4">
               <section className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
@@ -1302,6 +1357,7 @@ export function FinancePage({
               </section>
             </div>
           </div>
+          </div>{/* end hidden legacy */}
         </>
       )}
 
@@ -1368,8 +1424,19 @@ export function FinancePage({
         <div className="grid gap-4 lg:grid-cols-2">
           <section className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
             <h2 className="text-sm font-semibold">Misc Credits</h2>
-            <form className="mt-4 space-y-3" onSubmit={submitCredit}>
-              <select name="collegeId" className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm" required>
+            <form
+              className="mt-4 space-y-3"
+              onSubmit={submitCredit}
+            >
+              <select
+                name="collegeId"
+                className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm"
+                required
+                onChange={(e) => {
+                  setMiscCreditCollegeId(e.target.value);
+                  void loadMiscTxns(e.target.value);
+                }}
+              >
                 {colleges.map((college) => (
                   <option key={college.id} value={college.id}>{college.name}</option>
                 ))}
@@ -1381,15 +1448,69 @@ export function FinancePage({
             </form>
           </section>
 
-          <Panel title="Controlled Adjustments" description="Approval-based financial adjustments.">
-            <div className="space-y-2 text-sm">
-              <button type="button" disabled={!canAdjust} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-left disabled:opacity-60">Fee concession</button>
-              <button type="button" disabled={!canAdjust} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-left disabled:opacity-60">Fine waiver</button>
-              <button type="button" disabled={!canAdjust} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-left disabled:opacity-60">Excess refund</button>
-              <button type="button" disabled={!canAdjust} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-left disabled:opacity-60">Credit note</button>
-              <button type="button" disabled={!canAdjust} className="w-full rounded-xl border border-slate-300 px-3 py-2 text-left disabled:opacity-60">Scholarship adjustment</button>
+          {/* Transaction List — replaces static "Controlled Adjustments" */}
+          <section className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
+            <div className="flex items-center justify-between">
+              <div>
+                <h2 className="text-sm font-semibold">Recent Entries</h2>
+                <p className="mt-0.5 text-xs text-slate-500">Last 50 misc credit transactions. Reverse instead of deleting.</p>
+              </div>
+              {miscTxnsLoading && (
+                <span className="text-xs text-slate-400 animate-pulse">Loading…</span>
+              )}
             </div>
-          </Panel>
+
+            {miscTxns.length === 0 && !miscTxnsLoading ? (
+              <p className="mt-6 text-center text-xs text-slate-400">
+                {miscCreditCollegeId ? "No transactions yet for this college." : "Select a college to view transactions."}
+              </p>
+            ) : (
+              <div className="mt-4 overflow-x-auto">
+                <table className="w-full text-xs">
+                  <thead>
+                    <tr className="border-b border-slate-100 text-left text-slate-400 uppercase tracking-wide">
+                      <th className="pb-2 pr-3 font-medium">Date</th>
+                      <th className="pb-2 pr-3 font-medium">Voucher</th>
+                      <th className="pb-2 pr-3 font-medium">Remarks</th>
+                      <th className="pb-2 pr-3 font-medium text-right">Amount</th>
+                      <th className="pb-2 font-medium">Action</th>
+                    </tr>
+                  </thead>
+                  <tbody className="divide-y divide-slate-50">
+                    {miscTxns.map((txn) => (
+                      <tr key={txn.id} className={txn.isReversed ? "opacity-50" : ""}>
+                        <td className="py-2 pr-3 text-slate-500 whitespace-nowrap">
+                          {new Date(txn.date).toLocaleDateString("en-IN", { day: "2-digit", month: "short", year: "2-digit" })}
+                        </td>
+                        <td className="py-2 pr-3 font-mono text-slate-700">{txn.voucherNo}</td>
+                        <td className="py-2 pr-3 text-slate-600 max-w-[140px] truncate" title={txn.remarks ?? ""}>
+                          {txn.remarks ?? "—"}
+                        </td>
+                        <td className="py-2 pr-3 text-right tabular-nums font-medium text-emerald-700">
+                          ₹{Number(txn.amount).toLocaleString("en-IN", { minimumFractionDigits: 2 })}
+                        </td>
+                        <td className="py-2">
+                          {txn.isReversed ? (
+                            <span className="inline-flex items-center rounded-full bg-rose-50 px-2 py-0.5 text-xs font-medium text-rose-600 ring-1 ring-inset ring-rose-200">
+                              Reversed
+                            </span>
+                          ) : canReverse ? (
+                            <button
+                              type="button"
+                              onClick={() => handleReverseTransaction(txn.id)}
+                              className="rounded-lg border border-slate-200 px-2 py-0.5 text-xs text-slate-600 hover:bg-rose-50 hover:border-rose-200 hover:text-rose-700 transition-colors"
+                            >
+                              Reverse
+                            </button>
+                          ) : null}
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </table>
+              </div>
+            )}
+          </section>
         </div>
       )}
 
@@ -1403,66 +1524,13 @@ export function FinancePage({
         />
       )}
 
-      {activeModule === "ledger-receipts" && (
+      {activeModule === "cash-ledger" && (
         <section className="rounded-3xl bg-white p-5 shadow-sm ring-1 ring-slate-100">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <h2 className="text-sm font-semibold">Ledger & Receipts</h2>
-            <button type="button" onClick={() => setStudentLedgerRefreshKey((value) => value + 1)} className="inline-flex items-center gap-1 rounded-xl border border-slate-300 px-3 py-2 text-sm">
-              <RefreshCcw className="h-4 w-4" /> Refresh
-            </button>
-          </div>
-
-          <div className="mt-3 flex flex-wrap items-center gap-2">
-            <input value={ledgerReceiptSearch} onChange={(event) => setLedgerReceiptSearch(event.target.value)} placeholder="Search receipt number or cycle" className="rounded-xl bg-slate-100 px-3 py-2 text-sm" />
-            <input value={ledgerPresetName} onChange={(event) => setLedgerPresetName(event.target.value)} placeholder="Preset name" className="rounded-xl bg-slate-100 px-3 py-2 text-sm" />
-            <button type="button" onClick={saveLedgerPreset} className="rounded-xl bg-slate-900 px-3 py-2 text-sm font-medium text-white">Save Preset</button>
-            <select value={selectedLedgerPresetId} onChange={(event) => applyLedgerPresetById(event.target.value)} className="rounded-xl bg-slate-100 px-3 py-2 text-sm">
-              <option value="">Apply saved preset</option>
-              {savedLedgerPresets.map((preset) => (
-                <option key={preset.id} value={preset.id}>{preset.name}</option>
-              ))}
-            </select>
-            <button type="button" onClick={deleteLedgerPreset} disabled={!selectedLedgerPresetId} className="rounded-xl bg-slate-200 px-3 py-2 text-sm font-medium text-slate-700 disabled:opacity-60">Delete</button>
-            <button type="button" onClick={exportLedgerReceiptsCsv} className="rounded-xl border border-slate-300 px-3 py-2 text-sm font-medium text-slate-700">Export CSV</button>
-          </div>
-
-          <div className="mt-4 overflow-hidden rounded-2xl border border-slate-200">
-            <table className="min-w-full divide-y divide-slate-100 text-sm">
-              <thead>
-                <tr className="bg-slate-50 text-left text-xs uppercase tracking-wide text-slate-500">
-                  <th className="px-3 py-2">Receipt No</th>
-                  <th className="px-3 py-2">Student</th>
-                  <th className="px-3 py-2">Cycle</th>
-                  <th className="px-3 py-2">Amount</th>
-                  <th className="px-3 py-2">Date</th>
-                  <th className="px-3 py-2">Action</th>
-                </tr>
-              </thead>
-              <tbody className="divide-y divide-slate-100">
-                {filteredLedgerReceipts.map((receipt) => (
-                  <tr key={receipt.id}>
-                    <td className="px-3 py-2 font-medium">{receipt.receiptNumber}</td>
-                    <td className="px-3 py-2">{selectedStudent ? formatStudentLabel(selectedStudent) : "--"}</td>
-                    <td className="px-3 py-2">{receipt.cycleLabel ?? "Fee"}</td>
-                    <td className="px-3 py-2">{formatCurrency(receipt.totalReceived)}</td>
-                    <td className="px-3 py-2">{new Date(receipt.collectedAt).toLocaleDateString()}</td>
-                    <td className="px-3 py-2">
-                      <div className="flex flex-wrap gap-1">
-                        <button type="button" onClick={() => void printReceipt(receipt.receiptNumber, trustName)} className="rounded-lg bg-slate-100 px-2 py-1 text-xs">Print</button>
-                        <button type="button" disabled={!canReverse} className="rounded-lg border border-slate-300 px-2 py-1 text-xs disabled:opacity-60">Reverse</button>
-                        <button type="button" disabled={!canReverse} className="rounded-lg border border-slate-300 px-2 py-1 text-xs disabled:opacity-60">Void</button>
-                      </div>
-                    </td>
-                  </tr>
-                ))}
-                {filteredLedgerReceipts.length === 0 && (
-                  <tr>
-                    <td className="px-3 py-4 text-slate-500" colSpan={6}>No receipts available for selected student.</td>
-                  </tr>
-                )}
-              </tbody>
-            </table>
-          </div>
+          <CashLedger
+            colleges={colleges}
+            defaultCollegeId={user?.staff?.collegeId ?? colleges[0]?.id}
+            trustName={trustName}
+          />
         </section>
       )}
 
@@ -1818,6 +1886,12 @@ function ExpenseManagement({
   // Approval state
   const [rejectingId, setRejectingId] = useState<string | null>(null);
 
+  // Budget edit state
+  const [editingBudget, setEditingBudget] = useState<ExpenseBudget | null>(null);
+
+  // Recurring posting state
+  const [postingRecurringId, setPostingRecurringId] = useState<string | null>(null);
+
   // Reports + audit state
   const [reportDateFrom, setReportDateFrom] = useState("");
   const [reportDateTo, setReportDateTo] = useState("");
@@ -1861,7 +1935,7 @@ function ExpenseManagement({
         api.get<ExpenseBudget[]>("/finance/budgets", { params: { ...params, financialYear: currentFY } }),
         api.get<ExpenseRecurring[]>("/finance/recurring-expenses", { params }),
         api.get<PettyCashEntry[]>("/finance/petty-cash", { params }),
-        api.get<Expense[]>("/finance/expenses", { params: expenseParams }),
+        api.get<{ data: Expense[]; hasMore: boolean; nextCursor?: string }>("/finance/expenses", { params: expenseParams }),
         api.get<ExpenseReportResponse>("/finance/expenses/reports", { params: reportsParams }),
         api.get<ExpenseAuditLog[]>("/finance/expenses/audit-logs", { params: auditParams }),
       ]);
@@ -1869,7 +1943,8 @@ function ExpenseManagement({
       setBudgets(budgetsRes.data);
       setRecurring(recurringRes.data);
       setPettyCash(pettyCashRes.data);
-      setDetailExpenses(expensesRes.data);
+      // Backend returns array directly (listExpensesFiltered) or paginated {data:[]} shape
+      setDetailExpenses(Array.isArray(expensesRes.data) ? expensesRes.data : (expensesRes.data.data ?? []));
       setReportData(reportsRes.data);
       setAuditLogs(auditRes.data);
     } catch {
@@ -1878,6 +1953,18 @@ function ExpenseManagement({
       setDataLoading(false);
     }
   }
+
+  // Sync filterCollegeId to colleges[0] once colleges are available
+  useEffect(() => {
+    if (!filterCollegeId && colleges.length > 0) {
+      setFilterCollegeId(colleges[0].id);
+    }
+  }, [colleges, filterCollegeId]);
+
+  // Keep expCollegeId (Add Expense form) in sync with the header college filter
+  useEffect(() => {
+    if (filterCollegeId) setExpCollegeId(filterCollegeId);
+  }, [filterCollegeId]);
 
   useEffect(() => { void loadData(); }, [filterCollegeId, filterStatus, filterCategory, reportDateFrom, reportDateTo, auditAction]);
 
@@ -1920,21 +2007,69 @@ function ExpenseManagement({
 
   const budgetUtilization = useMemo(() => {
     return budgets.map((b) => {
+      // Count all non-rejected expenses as committed spend (PENDING = committed, APPROVED = actual debit)
       const spent = detailExpenses
-        .filter((e) => e.category === b.category && e.approvalStatus === "APPROVED")
+        .filter((e) => e.category === b.category && e.approvalStatus !== "REJECTED")
         .reduce((sum, e) => sum + Number(e.amount), 0);
-      const pct = Number(b.allocatedAmount) > 0 ? Math.round((spent / Number(b.allocatedAmount)) * 100) : 0;
-      return { ...b, spent, pct };
+      // Fallback: use category total from reports API (catches history outside the 500-record window)
+      const reportSpent = Number(reportData?.byCategory?.find((c) => c.name === b.category)?.amount ?? 0);
+      const effectiveSpent = Math.max(spent, reportSpent);
+      const pct = Number(b.allocatedAmount) > 0 ? Math.round((effectiveSpent / Number(b.allocatedAmount)) * 100) : 0;
+      return { ...b, spent: effectiveSpent, pct };
     });
-  }, [budgets, detailExpenses]);
+  }, [budgets, detailExpenses, reportData]);
 
   // ── Actions ───────────────────────────────────────────────────────────────
   async function handleApprove(id: string) {
-    try { await api.post(`/finance/expenses/${id}/approve`); await loadData(); } catch { /* ignore */ }
+    try {
+      await api.post(`/finance/expenses/${id}/approve`);
+      await loadData();
+    } catch (err) {
+      const msg = (err as { response?: { data?: { message?: string } } }).response?.data?.message ?? "Approval failed";
+      alert(msg);
+    }
   }
 
   async function handleReject(id: string, note: string) {
-    try { await api.post(`/finance/expenses/${id}/reject`, { note }); setRejectingId(null); await loadData(); } catch { /* ignore */ }
+    try {
+      await api.post(`/finance/expenses/${id}/reject`, { note });
+      setRejectingId(null);
+      await loadData();
+    } catch (err) {
+      const msg = (err as { response?: { data?: { message?: string } } }).response?.data?.message ?? "Rejection failed";
+      alert(msg);
+    }
+  }
+
+  async function handleDeleteBudget(budgetId: string) {
+    if (!window.confirm("Delete this budget allocation? This cannot be undone.")) return;
+    try {
+      await api.delete(`/finance/budgets/${budgetId}`);
+      await loadData();
+    } catch {
+      alert("Could not delete budget. Please try again.");
+    }
+  }
+
+  function openEditBudget(b: ExpenseBudget) {
+    setEditingBudget(b);
+    setBudgetCollegeId(b.collegeId);
+    setBudgetForm({ category: b.category, allocatedAmount: String(b.allocatedAmount), financialYear: b.financialYear });
+    setBudgetFormOpen(true);
+  }
+
+  async function handlePostRecurring(id: string) {
+    setPostingRecurringId(id);
+    try {
+      await api.post(`/finance/recurring-expenses/${id}/post`);
+      await loadData();
+      setActiveTab("approvals");
+    } catch (err) {
+      const msg = (err as { response?: { data?: { message?: string } } }).response?.data?.message ?? "Failed to post expense";
+      alert(msg);
+    } finally {
+      setPostingRecurringId(null);
+    }
   }
 
   async function uploadAttachment(file: File) {
@@ -2049,8 +2184,19 @@ function ExpenseManagement({
   async function submitBudget(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
-      await api.post("/finance/budgets", { collegeId: budgetCollegeId, ...budgetForm, allocatedAmount: Number(budgetForm.allocatedAmount) });
+      if (editingBudget) {
+        // Update: re-upsert with same key fields, new allocatedAmount
+        await api.post("/finance/budgets", {
+          collegeId: editingBudget.collegeId,
+          category: editingBudget.category,
+          financialYear: editingBudget.financialYear,
+          allocatedAmount: Number(budgetForm.allocatedAmount),
+        });
+      } else {
+        await api.post("/finance/budgets", { collegeId: budgetCollegeId, ...budgetForm, allocatedAmount: Number(budgetForm.allocatedAmount) });
+      }
       setBudgetForm({ category: "Operational", allocatedAmount: "", financialYear: currentFY });
+      setEditingBudget(null);
       setBudgetFormOpen(false);
       await loadData();
     } catch { /* ignore */ }
@@ -2069,7 +2215,7 @@ function ExpenseManagement({
   async function submitPettyCash(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     try {
-      await api.post("/finance/petty-cash", { collegeId: pettyCollegeId, ...pettyForm, amount: Number(pettyForm.amount) });
+      await api.post("/finance/petty-cash", { collegeId: filterCollegeId || pettyCollegeId, ...pettyForm, amount: Number(pettyForm.amount) });
       setPettyForm({ entryType: "EXPENSE", amount: "", description: "", reference: "" });
       await loadData();
     } catch { /* ignore */ }
@@ -2357,12 +2503,6 @@ function ExpenseManagement({
             <form onSubmit={submitExpense} className="space-y-3">
               <div className="grid gap-3 sm:grid-cols-2">
                 <div>
-                  <label className="mb-1 block text-xs text-slate-500">Institution</label>
-                  <select value={expCollegeId} onChange={(e) => setExpCollegeId(e.target.value)} className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm" required>
-                    {colleges.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-                  </select>
-                </div>
-                <div>
                   <label className="mb-1 block text-xs text-slate-500">Category</label>
                   <select value={expCategory} onChange={(e) => { setExpCategory(e.target.value); setExpSubcategory(""); }} className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm" required>
                     {Object.keys(EXPENSE_CATEGORY_MAP).map((c) => <option key={c} value={c}>{c}</option>)}
@@ -2517,14 +2657,15 @@ function ExpenseManagement({
                 <tr>
                   <th className="px-3 py-2">Category</th>
                   <th className="px-3 py-2">Allocated</th>
-                  <th className="px-3 py-2">Spent</th>
+                  <th className="px-3 py-2">Spent (Ledger)</th>
                   <th className="px-3 py-2">Remaining</th>
                   <th className="px-3 py-2">Utilization</th>
+                  {canApprove && <th className="px-3 py-2">Actions</th>}
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {budgetUtilization.length === 0 && (
-                  <tr><td colSpan={5} className="px-3 py-6 text-center text-slate-400">No budgets for FY {currentFY}. Click "Set Budget" to configure.</td></tr>
+                  <tr><td colSpan={canApprove ? 6 : 5} className="px-3 py-6 text-center text-slate-400">No budgets for FY {currentFY}. Click "Set Budget" to configure.</td></tr>
                 )}
                 {budgetUtilization.map((b) => (
                   <tr key={b.id} className="hover:bg-slate-50">
@@ -2542,6 +2683,14 @@ function ExpenseManagement({
                         <span className="text-xs text-slate-500">{b.pct}%</span>
                       </div>
                     </td>
+                    {canApprove && (
+                      <td className="px-3 py-2">
+                        <div className="flex gap-1">
+                          <button type="button" onClick={() => openEditBudget(b)} className="rounded-lg bg-slate-100 px-2 py-1 text-xs hover:bg-slate-200">Edit</button>
+                          <button type="button" onClick={() => void handleDeleteBudget(b.id)} className="rounded-lg bg-red-50 px-2 py-1 text-xs text-red-600 hover:bg-red-100">Delete</button>
+                        </div>
+                      </td>
+                    )}
                   </tr>
                 ))}
               </tbody>
@@ -2552,17 +2701,19 @@ function ExpenseManagement({
               <div className="w-full max-w-md rounded-2xl bg-white p-5 shadow-2xl">
                 <h3 className="mb-4 text-base font-semibold">Set Budget Allocation</h3>
                 <form onSubmit={submitBudget} className="space-y-3">
+                  {!editingBudget && (
                   <select value={budgetCollegeId} onChange={(e) => setBudgetCollegeId(e.target.value)} className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm">
                     {colleges.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
                   </select>
-                  <select value={budgetForm.category} onChange={(e) => setBudgetForm((f) => ({ ...f, category: e.target.value }))} className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm">
+                  )}
+                  <select value={budgetForm.category} onChange={(e) => setBudgetForm((f) => ({ ...f, category: e.target.value }))} disabled={!!editingBudget} className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm disabled:opacity-70">
                     {Object.keys(EXPENSE_CATEGORY_MAP).map((c) => <option key={c} value={c}>{c}</option>)}
                   </select>
                   <input value={budgetForm.financialYear} onChange={(e) => setBudgetForm((f) => ({ ...f, financialYear: e.target.value }))} placeholder="Financial Year (e.g. 2025-26)" className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm" required />
                   <input type="number" min="1" step="0.01" value={budgetForm.allocatedAmount} onChange={(e) => setBudgetForm((f) => ({ ...f, allocatedAmount: e.target.value }))} placeholder="Allocated Amount (₹)" className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm" required />
                   <div className="flex gap-2">
-                    <button type="submit" className="flex-1 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white">Save</button>
-                    <button type="button" onClick={() => setBudgetFormOpen(false)} className="flex-1 rounded-xl bg-slate-100 px-4 py-2.5 text-sm">Cancel</button>
+                    <button type="submit" className="flex-1 rounded-xl bg-slate-900 px-4 py-2.5 text-sm font-semibold text-white">{editingBudget ? "Update" : "Save"}</button>
+                    <button type="button" onClick={() => { setBudgetFormOpen(false); setEditingBudget(null); }} className="flex-1 rounded-xl bg-slate-100 px-4 py-2.5 text-sm">Cancel</button>
                   </div>
                 </form>
               </div>
@@ -2682,9 +2833,22 @@ function ExpenseManagement({
                       </td>
                       {canWrite && (
                         <td className="px-3 py-2">
-                          <button type="button" onClick={() => void toggleRecurring(r.id, r.isActive)} className="rounded-lg bg-slate-100 px-2 py-1 text-xs hover:bg-slate-200">
-                            {r.isActive ? "Pause" : "Resume"}
-                          </button>
+                          <div className="flex gap-1">
+                            <button type="button" onClick={() => void toggleRecurring(r.id, r.isActive)} className="rounded-lg bg-slate-100 px-2 py-1 text-xs hover:bg-slate-200">
+                              {r.isActive ? "Pause" : "Resume"}
+                            </button>
+                            {r.isActive && (
+                              <button
+                                type="button"
+                                disabled={postingRecurringId === r.id}
+                                onClick={() => void handlePostRecurring(r.id)}
+                                className="rounded-lg bg-blue-50 px-2 py-1 text-xs text-blue-700 hover:bg-blue-100 disabled:opacity-60"
+                                title="Generate a pending expense for this recurring entry (goes to Approvals)"
+                              >
+                                {postingRecurringId === r.id ? "Posting…" : "Post Now"}
+                              </button>
+                            )}
+                          </div>
                         </td>
                       )}
                     </tr>
@@ -2732,9 +2896,6 @@ function ExpenseManagement({
               <span className="rounded-full bg-slate-100 px-3 py-1 text-xs font-semibold">{formatINR(pettyCashBalance)} balance</span>
             </div>
             <form onSubmit={submitPettyCash} className="space-y-3">
-              <select value={pettyCollegeId} onChange={(e) => setPettyCollegeId(e.target.value)} className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm">
-                {colleges.map((c) => <option key={c.id} value={c.id}>{c.name}</option>)}
-              </select>
               <select value={pettyForm.entryType} onChange={(e) => setPettyForm((f) => ({ ...f, entryType: e.target.value }))} className="w-full rounded-xl bg-slate-100 px-3 py-2.5 text-sm">
                 <option value="ALLOCATION">Allocation (top-up)</option>
                 <option value="EXPENSE">Expense (debit)</option>

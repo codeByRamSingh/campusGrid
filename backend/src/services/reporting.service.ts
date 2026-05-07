@@ -1,4 +1,4 @@
-import { AdmissionWorkflowStatus, PrismaClient } from "@prisma/client";
+import { AdmissionWorkflowStatus, Prisma, PrismaClient } from "@prisma/client";
 
 type ReportScope = {
   collegeId?: string;
@@ -260,51 +260,224 @@ export async function buildReceivablesAgingReport(prisma: PrismaClient, scope: R
   };
 }
 
+/**
+ * Phase 3 — Ledger-driven summary.
+ *
+ * Primary source: FinancialTransaction (the single source of truth for all new
+ * transactions written after the Phase 2 enforcement layer was deployed).
+ *
+ * Legacy fallback: for records that existed before the FinancialTransaction
+ * table was populated we continue to read from the originating module tables
+ * (Payment, Credit, Expense, Payroll) with NOT-EXISTS deduplication so totals
+ * are never double-counted.
+ *
+ * For SUPER_ADMIN multi-college views (collegeId = undefined) we fall back to
+ * the legacy aggregate-only approach since parameterized raw SQL requires a
+ * fixed collegeId.
+ */
 export async function buildLedgerSummary(
   prisma: PrismaClient,
   input: { period: LedgerPeriod; collegeId?: string }
 ) {
   const { startDate, endDate } = getPeriodWindow(input.period);
-  const collegeFilter = input.collegeId ? { collegeId: input.collegeId } : {};
 
-  const [feeCollection, miscCredits, expenses, payroll] = await Promise.all([
-    prisma.payment.aggregate({
-      where: {
-        ...collegeFilter,
-        paymentType: { in: ["FEE_COLLECTION", "MISC_CREDIT"] },
-        paidAt: { gte: startDate, lte: endDate },
-      },
-      _sum: { amount: true },
-    }),
-    prisma.credit.aggregate({
-      where: {
-        ...collegeFilter,
-        createdAt: { gte: startDate, lte: endDate },
-      },
-      _sum: { amount: true },
-    }),
-    prisma.expense.aggregate({
-      where: {
-        ...collegeFilter,
-        spentOn: { gte: startDate, lte: endDate },
-      },
-      _sum: { amount: true },
-    }),
-    prisma.payroll.aggregate({
-      where: {
-        ...(input.collegeId ? { staff: { collegeId: input.collegeId } } : {}),
-        paidAt: { gte: startDate, lte: endDate },
-      },
-      _sum: { amount: true },
-    }),
+  // ── Multi-college fallback (SUPER_ADMIN) ─────────────────────────────────
+  if (!input.collegeId) {
+    const [feeCollection, miscCredits, expenses, payroll] = await Promise.all([
+      prisma.payment.aggregate({
+        where: { paymentType: { in: ["FEE_COLLECTION", "MISC_CREDIT"] }, paidAt: { gte: startDate, lte: endDate } },
+        _sum: { amount: true },
+      }),
+      prisma.credit.aggregate({ where: { createdAt: { gte: startDate, lte: endDate } }, _sum: { amount: true } }),
+      prisma.expense.aggregate({ where: { spentOn: { gte: startDate, lte: endDate } }, _sum: { amount: true } }),
+      prisma.payroll.aggregate({ where: { paidAt: { gte: startDate, lte: endDate } }, _sum: { amount: true } }),
+    ]);
+
+    const totalFeeDeposit = Number(feeCollection._sum.amount || 0);
+    const totalMiscCredits = Number(miscCredits._sum.amount || 0);
+    const totalExpenses = Number(expenses._sum.amount || 0);
+    const totalPayroll = Number(payroll._sum.amount || 0);
+    const closingBalance = totalFeeDeposit + totalMiscCredits - totalExpenses - totalPayroll;
+    return {
+      period: input.period, startDate: startDate.toISOString(), endDate: endDate.toISOString(),
+      openingBalance: 0, totalFeeDeposit, totalMiscCredits, totalExpenses, totalPayroll, closingBalance,
+      formula: "Closing Balance = (Fee Deposit + Misc Credits) - (Expenses + Payroll)",
+      source: "legacy_aggregate",
+    };
+  }
+
+  // ── Single-college: FinancialTransaction as primary source ───────────────
+  const collegeId = input.collegeId;
+
+  type SummaryRow = {
+    total_fee_credit: string;
+    total_misc_credit: string;
+    total_expense_debit: string;
+    total_salary_debit: string;
+    total_petty_net: string;
+  };
+
+  const [summaryRows, openingRows] = await Promise.all([
+    // ─ Period totals (unified, deduplicated) ─────────────────────────────
+    prisma.$queryRaw<SummaryRow[]>(Prisma.sql`
+      SELECT
+        COALESCE(SUM(CASE WHEN side = 'FEE_CREDIT'     THEN amount END), 0)::text AS total_fee_credit,
+        COALESCE(SUM(CASE WHEN side = 'MISC_CREDIT'    THEN amount END), 0)::text AS total_misc_credit,
+        COALESCE(SUM(CASE WHEN side = 'EXPENSE_DEBIT'  THEN amount END), 0)::text AS total_expense_debit,
+        COALESCE(SUM(CASE WHEN side = 'SALARY_DEBIT'   THEN amount END), 0)::text AS total_salary_debit,
+        COALESCE(SUM(CASE WHEN side = 'PETTY_NET'      THEN amount END), 0)::text AS total_petty_net
+      FROM (
+        -- FinancialTransaction FEES (fee collections)
+        SELECT ft.amount::numeric AS amount, 'FEE_CREDIT' AS side
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId} AND ft.source = 'FEES' AND ft.type = 'CREDIT'
+          AND ft."isReversed" = false AND ft.date >= ${startDate} AND ft.date <= ${endDate}
+
+        UNION ALL
+        -- FinancialTransaction MISC / ADJUSTMENT credits
+        SELECT ft.amount::numeric, 'MISC_CREDIT'
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId} AND ft.source IN ('MISC','ADJUSTMENT') AND ft.type = 'CREDIT'
+          AND ft."isReversed" = false AND ft.date >= ${startDate} AND ft.date <= ${endDate}
+
+        UNION ALL
+        -- FinancialTransaction EXPENSE debits
+        SELECT ft.amount::numeric, 'EXPENSE_DEBIT'
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId} AND ft.source = 'EXPENSE' AND ft.type = 'DEBIT'
+          AND ft.date >= ${startDate} AND ft.date <= ${endDate}
+
+        UNION ALL
+        -- FinancialTransaction SALARY debits
+        SELECT ft.amount::numeric, 'SALARY_DEBIT'
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId} AND ft.source = 'SALARY' AND ft.type = 'DEBIT'
+          AND ft.date >= ${startDate} AND ft.date <= ${endDate}
+
+        UNION ALL
+        -- FinancialTransaction PETTY_CASH net (credit - debit)
+        SELECT
+          CASE WHEN ft.type = 'CREDIT' THEN ft.amount::numeric ELSE -ft.amount::numeric END, 'PETTY_NET'
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId} AND ft.source = 'PETTY_CASH'
+          AND ft.date >= ${startDate} AND ft.date <= ${endDate}
+
+        UNION ALL
+        -- Legacy Payment FEE_COLLECTION not yet in FinancialTransaction
+        SELECT p.amount::numeric, 'FEE_CREDIT'
+        FROM "Payment" p
+        WHERE p."collegeId" = ${collegeId} AND p."paymentType" = 'FEE_COLLECTION'
+          AND p."paidAt" >= ${startDate} AND p."paidAt" <= ${endDate}
+          AND NOT EXISTS (SELECT 1 FROM "PaymentReversal" pr WHERE pr."paymentId" = p.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft2
+            WHERE ft2."voucherNo" = p."receiptNumber" AND ft2.source = 'FEES'
+          )
+
+        UNION ALL
+        -- Legacy Payment MISC_CREDIT not yet in FinancialTransaction
+        SELECT p.amount::numeric, 'MISC_CREDIT'
+        FROM "Payment" p
+        WHERE p."collegeId" = ${collegeId} AND p."paymentType" = 'MISC_CREDIT'
+          AND p."paidAt" >= ${startDate} AND p."paidAt" <= ${endDate}
+          AND NOT EXISTS (SELECT 1 FROM "PaymentReversal" pr WHERE pr."paymentId" = p.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft2
+            WHERE ft2."voucherNo" = p."receiptNumber" AND ft2.source = 'MISC'
+          )
+
+        UNION ALL
+        -- Legacy Credit table
+        SELECT c.amount::numeric, 'MISC_CREDIT'
+        FROM "Credit" c
+        WHERE c."collegeId" = ${collegeId}
+          AND c."createdAt" >= ${startDate} AND c."createdAt" <= ${endDate}
+
+        UNION ALL
+        -- Legacy Expense not yet in FinancialTransaction
+        SELECT e.amount::numeric, 'EXPENSE_DEBIT'
+        FROM "Expense" e
+        WHERE e."collegeId" = ${collegeId} AND e."approvalStatus" = 'APPROVED'
+          AND e."spentOn" >= ${startDate} AND e."spentOn" <= ${endDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft3
+            WHERE ft3."referenceNo" = e.id AND ft3.source = 'EXPENSE'
+          )
+
+        UNION ALL
+        -- Legacy Payroll not yet in FinancialTransaction
+        SELECT py."netAmount"::numeric, 'SALARY_DEBIT'
+        FROM "Payroll" py
+        JOIN "Staff" s ON py."staffId" = s.id
+        WHERE s."collegeId" = ${collegeId} AND py.status = 'PAID'
+          AND py."paidAt" >= ${startDate} AND py."paidAt" <= ${endDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft4
+            WHERE ft4."referenceNo" = py.id AND ft4.source = 'SALARY'
+          )
+      ) unified
+    `),
+
+    // ─ Opening balance (everything before startDate) ─────────────────────
+    prisma.$queryRaw<Array<{ opening_balance: string }>>(Prisma.sql`
+      SELECT COALESCE(SUM(
+        CASE WHEN src = 'CREDIT' THEN amt ELSE -amt END
+      ), 0)::text AS opening_balance
+      FROM (
+        SELECT ft.amount::numeric AS amt,
+               CASE WHEN ft.type = 'CREDIT' THEN 'CREDIT' ELSE 'DEBIT' END AS src
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId} AND ft."isReversed" = false
+          AND ft.date < ${startDate}
+
+        UNION ALL
+        SELECT p.amount::numeric, 'CREDIT'
+        FROM "Payment" p
+        WHERE p."collegeId" = ${collegeId}
+          AND p."paymentType" IN ('FEE_COLLECTION','MISC_CREDIT')
+          AND p."paidAt" < ${startDate}
+          AND NOT EXISTS (SELECT 1 FROM "PaymentReversal" pr WHERE pr."paymentId" = p.id)
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft2
+            WHERE ft2."voucherNo" = p."receiptNumber" AND ft2.source IN ('FEES','MISC')
+          )
+
+        UNION ALL
+        SELECT c.amount::numeric, 'CREDIT'
+        FROM "Credit" c
+        WHERE c."collegeId" = ${collegeId} AND c."createdAt" < ${startDate}
+
+        UNION ALL
+        SELECT e.amount::numeric, 'DEBIT'
+        FROM "Expense" e
+        WHERE e."collegeId" = ${collegeId} AND e."approvalStatus" = 'APPROVED'
+          AND e."spentOn" < ${startDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft3
+            WHERE ft3."referenceNo" = e.id AND ft3.source = 'EXPENSE'
+          )
+
+        UNION ALL
+        SELECT py."netAmount"::numeric, 'DEBIT'
+        FROM "Payroll" py
+        JOIN "Staff" s ON py."staffId" = s.id
+        WHERE s."collegeId" = ${collegeId} AND py.status = 'PAID'
+          AND py."paidAt" < ${startDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft4
+            WHERE ft4."referenceNo" = py.id AND ft4.source = 'SALARY'
+          )
+      ) legacy
+    `),
   ]);
 
-  const openingBalance = 0;
-  const totalFeeDeposit = Number(feeCollection._sum.amount || 0);
-  const totalMiscCredits = Number(miscCredits._sum.amount || 0);
-  const totalExpenses = Number(expenses._sum.amount || 0);
-  const totalPayroll = Number(payroll._sum.amount || 0);
-  const closingBalance = openingBalance + totalFeeDeposit + totalMiscCredits - (totalExpenses + totalPayroll);
+  const row = summaryRows[0];
+  const openingBalance = parseFloat(openingRows[0]?.opening_balance ?? "0");
+  const totalFeeDeposit  = parseFloat(row?.total_fee_credit    ?? "0");
+  const totalMiscCredits = parseFloat(row?.total_misc_credit   ?? "0");
+  const totalExpenses    = parseFloat(row?.total_expense_debit ?? "0");
+  const totalPayroll     = parseFloat(row?.total_salary_debit  ?? "0");
+  const closingBalance   = openingBalance + totalFeeDeposit + totalMiscCredits - totalExpenses - totalPayroll;
 
   return {
     period: input.period,
@@ -316,10 +489,447 @@ export async function buildLedgerSummary(
     totalExpenses,
     totalPayroll,
     closingBalance,
-    formula:
-      "Closing Balance = (Opening balance + Total Fee Deposit + Misc Credits) - (Total Expenses + Total Payroll)",
+    formula: "Closing Balance = Opening + (Fee Deposit + Misc Credits) − (Expenses + Payroll)",
+    source: "ledger_driven",
   };
 }
+
+// ─── Cash Ledger ─────────────────────────────────────────────────────────────
+
+export type CashLedgerTransaction = {
+  id: string;
+  date: string;
+  voucher_no: string;
+  particulars: string;
+  party: string | null;
+  receipt_no: string | null;
+  debit: number;
+  credit: number;
+  mode: string;
+  running_balance: number;
+  remarks: string | null;
+  source_module: string;
+  is_reversed: boolean;
+};
+
+export type CashLedgerResponse = {
+  opening_balance: number;
+  transactions: CashLedgerTransaction[];
+  closing_balance: number;
+  total_credit: number;
+  total_debit: number;
+};
+
+export async function buildCashLedger(
+  prisma: PrismaClient,
+  input: { collegeId: string; startDate?: Date; endDate?: Date }
+): Promise<CashLedgerResponse> {
+  const { collegeId } = input;
+  // Default: start of current financial year (April 1) to end of day today
+  const now = new Date();
+  const fyStart = new Date(now.getMonth() >= 3 ? now.getFullYear() : now.getFullYear() - 1, 3, 1, 0, 0, 0, 0);
+  const startDate = input.startDate ?? fyStart;
+  const endDate = input.endDate ?? new Date(now.getFullYear(), now.getMonth(), now.getDate(), 23, 59, 59, 999);
+
+  // Opening balance: sum of all transactions before startDate
+  type OpeningRow = { opening_balance: string };
+  const openingRows = await prisma.$queryRaw<OpeningRow[]>(
+    Prisma.sql`
+      SELECT COALESCE(
+        SUM(CASE WHEN src = 'CREDIT' THEN amt ELSE -amt END),
+        0
+      )::text AS opening_balance
+      FROM (
+        -- FinancialTransaction: FEES, MISC, PETTY_CASH, REVERSAL (unified ledger)
+        SELECT
+          ft.amount::numeric AS amt,
+          CASE WHEN ft."type" = 'CREDIT' THEN 'CREDIT' ELSE 'DEBIT' END AS src
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId}
+          AND ft."source" IN ('FEES', 'MISC', 'PETTY_CASH', 'EXPENSE', 'SALARY', 'ADJUSTMENT', 'REVERSAL')
+          AND ft."date" < ${startDate}
+        UNION ALL
+        -- Legacy fee payments (Payment table, only for entries WITHOUT a FinancialTransaction counterpart)
+        SELECT p.amount::numeric AS amt, 'CREDIT' AS src
+        FROM "Payment" p
+        WHERE p."collegeId" = ${collegeId}
+          AND p."paymentType" IN ('FINE')
+          AND p."paidAt" < ${startDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "PaymentReversal" pr WHERE pr."paymentId" = p.id
+          )
+        UNION ALL
+        -- Legacy FEE_COLLECTION + MISC_CREDIT from Payment table (pre-FinancialTransaction migration)
+        SELECT p.amount::numeric AS amt, 'CREDIT' AS src
+        FROM "Payment" p
+        WHERE p."collegeId" = ${collegeId}
+          AND p."paymentType" IN ('FEE_COLLECTION', 'MISC_CREDIT')
+          AND p."paidAt" < ${startDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "PaymentReversal" pr WHERE pr."paymentId" = p.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft2
+            WHERE ft2."voucherNo" = p."receiptNumber"
+              AND ft2."source" IN ('FEES', 'MISC')
+          )
+        UNION ALL
+        -- Legacy misc credits (Credit table — pre-FinancialTransaction era)
+        SELECT c.amount::numeric AS amt, 'CREDIT' AS src
+        FROM "Credit" c
+        WHERE c."collegeId" = ${collegeId}
+          AND c."createdAt" < ${startDate}
+        UNION ALL
+        -- Legacy approved expenses (not yet in FinancialTransaction)
+        SELECT e.amount::numeric AS amt, 'DEBIT' AS src
+        FROM "Expense" e
+        WHERE e."collegeId" = ${collegeId}
+          AND e."approvalStatus" = 'APPROVED'
+          AND e."spentOn" < ${startDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft5
+            WHERE ft5."referenceNo" = e.id AND ft5.source = 'EXPENSE'
+          )
+        UNION ALL
+        -- Legacy paid payroll (not yet in FinancialTransaction)
+        SELECT py."netAmount"::numeric AS amt, 'DEBIT' AS src
+        FROM "Payroll" py
+        JOIN "Staff" s ON py."staffId" = s.id
+        WHERE s."collegeId" = ${collegeId}
+          AND py.status = 'PAID'
+          AND py."paidAt" < ${startDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft6
+            WHERE ft6."referenceNo" = py.id AND ft6.source = 'SALARY'
+          )
+        UNION ALL
+        -- Legacy fee payment reversals (not yet in FinancialTransaction as REVERSAL)
+        SELECT p2.amount::numeric AS amt, 'DEBIT' AS src
+        FROM "PaymentReversal" pr2
+        JOIN "Payment" p2 ON pr2."paymentId" = p2.id
+        WHERE p2."collegeId" = ${collegeId}
+          AND pr2."reversedAt" < ${startDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft7
+            WHERE ft7."referenceNo" = p2.id AND ft7.source = 'REVERSAL'
+          )
+      ) sub
+    `
+  );
+  const openingBalance = parseFloat(openingRows[0]?.opening_balance ?? "0");
+
+  // Transactions in date range with running balance (window function)
+  type TxnRow = {
+    id: string;
+    txn_date: Date;
+    voucher_no: string;
+    particulars: string;
+    party: string | null;
+    receipt_no: string | null;
+    debit: string;
+    credit: string;
+    mode: string;
+    remarks: string | null;
+    source_module: string;
+    is_reversed: boolean;
+    running_balance: string;
+  };
+
+  const openingBalanceDecimal = new Prisma.Decimal(openingBalance);
+
+  const rawTxns = await prisma.$queryRaw<TxnRow[]>(
+    Prisma.sql`
+      WITH base AS (
+        -- FinancialTransaction: FEES (fee collections via unified ledger)
+        SELECT
+          ft.id::text                                                        AS id,
+          ft."date"                                                          AS txn_date,
+          ft."voucherNo"                                                     AS voucher_no,
+          COALESCE(ft.remarks, 'Fee Received')                               AS particulars,
+          (
+            SELECT s2."candidateName" || ' (' ||
+                   COALESCE(s2."admissionCode", '#' || s2."admissionNumber"::text) || ')'
+            FROM "Student" s2 WHERE s2.id = ft."studentId"
+          )                                                                  AS party,
+          ft."voucherNo"                                                     AS receipt_no,
+          0::numeric                                                         AS debit,
+          ft.amount::numeric                                                 AS credit,
+          ft.mode                                                            AS mode,
+          ft.remarks                                                         AS remarks,
+          'FEES'                                                             AS source_module,
+          ft."isReversed"                                                    AS is_reversed
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId}
+          AND ft."source" = 'FEES'
+          AND ft."type" = 'CREDIT'
+          AND ft."date" >= ${startDate}
+          AND ft."date" <= ${endDate}
+
+        UNION ALL
+
+        -- Fine payments (still in Payment table — not yet in FinancialTransaction)
+        SELECT
+          p.id::text                                                         AS id,
+          p."paidAt"                                                         AS txn_date,
+          p."receiptNumber"                                                  AS voucher_no,
+          'Fine Collected'                                                   AS particulars,
+          COALESCE(
+            s."candidateName" || ' (' ||
+            COALESCE(s."admissionCode", '#' || s."admissionNumber"::text) || ')',
+            'Unknown'
+          )                                                                  AS party,
+          p."receiptNumber"                                                  AS receipt_no,
+          0::numeric                                                         AS debit,
+          p.amount::numeric                                                  AS credit,
+          COALESCE(p."paymentMode", 'CASH')                                  AS mode,
+          p.description                                                      AS remarks,
+          'FEES'                                                             AS source_module,
+          false                                                              AS is_reversed
+        FROM "Payment" p
+        LEFT JOIN "Student" s ON p."studentId" = s.id
+        WHERE p."collegeId" = ${collegeId}
+          AND p."paymentType" = 'FINE'
+          AND p."paidAt" >= ${startDate}
+          AND p."paidAt" <= ${endDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "PaymentReversal" pr WHERE pr."paymentId" = p.id
+          )
+
+        UNION ALL
+
+        -- Legacy fee collections (Payment table, for entries that pre-date the FinancialTransaction migration)
+        SELECT
+          p.id::text                                                         AS id,
+          p."paidAt"                                                         AS txn_date,
+          p."receiptNumber"                                                  AS voucher_no,
+          CASE
+            WHEN p."paymentType" = 'MISC_CREDIT' THEN 'Misc Credit'
+            ELSE 'Fee Received'
+          END                                                                AS particulars,
+          COALESCE(
+            s."candidateName" || ' (' ||
+            COALESCE(s."admissionCode", '#' || s."admissionNumber"::text) || ')',
+            'Unknown'
+          )                                                                  AS party,
+          p."receiptNumber"                                                  AS receipt_no,
+          0::numeric                                                         AS debit,
+          p.amount::numeric                                                  AS credit,
+          COALESCE(p."paymentMode", 'CASH')                                  AS mode,
+          p.description                                                      AS remarks,
+          'FEES'                                                             AS source_module,
+          false                                                              AS is_reversed
+        FROM "Payment" p
+        LEFT JOIN "Student" s ON p."studentId" = s.id
+        WHERE p."collegeId" = ${collegeId}
+          AND p."paymentType" IN ('FEE_COLLECTION', 'MISC_CREDIT')
+          AND p."paidAt" >= ${startDate}
+          AND p."paidAt" <= ${endDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "PaymentReversal" pr WHERE pr."paymentId" = p.id
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft2
+            WHERE ft2."voucherNo" = p."receiptNumber"
+              AND ft2."source" IN ('FEES', 'MISC')
+          )
+
+        UNION ALL
+
+        -- Legacy Misc Credits table (pre-FinancialTransaction records only)
+        SELECT
+          c.id::text                                                         AS id,
+          c."createdAt"                                                      AS txn_date,
+          ('MISC-' || UPPER(LEFT(c.id::text, 8)))                           AS voucher_no,
+          ('Misc Income: ' || c.source)                                     AS particulars,
+          NULL::text                                                         AS party,
+          NULL::text                                                         AS receipt_no,
+          0::numeric                                                         AS debit,
+          c.amount::numeric                                                  AS credit,
+          'BANK'                                                             AS mode,
+          c.notes                                                            AS remarks,
+          'ADJUSTMENT'                                                       AS source_module,
+          false                                                              AS is_reversed
+        FROM "Credit" c
+        WHERE c."collegeId" = ${collegeId}
+          AND c."createdAt" >= ${startDate}
+          AND c."createdAt" <= ${endDate}
+
+        UNION ALL
+
+        -- FinancialTransaction: non-FEES entries (MISC, PETTY_CASH, REVERSAL, EXPENSE, SALARY, ADJUSTMENT)
+        SELECT
+          ft.id::text                                                        AS id,
+          ft."date"                                                          AS txn_date,
+          ft."voucherNo"                                                     AS voucher_no,
+          CASE ft."source"
+            WHEN 'MISC'       THEN COALESCE(ft.remarks, 'Misc Credit')
+            WHEN 'PETTY_CASH' THEN COALESCE(ft.remarks, 'Petty Cash')
+            WHEN 'REVERSAL'   THEN COALESCE(ft.remarks, 'Reversal')
+            WHEN 'EXPENSE'    THEN COALESCE(ft.remarks, 'Expense')
+            WHEN 'SALARY'     THEN COALESCE(ft.remarks, 'Salary Payment')
+            ELSE COALESCE(ft.remarks, ft."source"::text)
+          END                                                                AS particulars,
+          CASE ft."source"
+            WHEN 'EXPENSE' THEN (
+              SELECT COALESCE(e."vendorName", v.name, e.description)
+              FROM "Expense" e LEFT JOIN "Vendor" v ON e."vendorId" = v.id
+              WHERE e.id = ft."referenceNo"
+            )
+            WHEN 'SALARY' THEN (
+              SELECT s."fullName"
+              FROM "Payroll" py JOIN "Staff" s ON py."staffId" = s.id
+              WHERE py.id = ft."referenceNo"
+            )
+            ELSE NULL::text
+          END                                                                AS party,
+          NULL::text                                                         AS receipt_no,
+          CASE WHEN ft."type" = 'DEBIT'  THEN ft.amount::numeric ELSE 0::numeric END AS debit,
+          CASE WHEN ft."type" = 'CREDIT' THEN ft.amount::numeric ELSE 0::numeric END AS credit,
+          ft.mode                                                            AS mode,
+          ft.remarks                                                         AS remarks,
+          ft."source"::text                                                  AS source_module,
+          ft."isReversed"                                                    AS is_reversed
+        FROM "FinancialTransaction" ft
+        WHERE ft."collegeId" = ${collegeId}
+          AND ft."source" IN ('MISC', 'PETTY_CASH', 'REVERSAL', 'EXPENSE', 'SALARY', 'ADJUSTMENT')
+          AND ft."date" >= ${startDate}
+          AND ft."date" <= ${endDate}
+
+        UNION ALL
+
+        -- Legacy Expenses (DEBIT) — only for records NOT yet in FinancialTransaction
+        SELECT
+          e.id::text                                                         AS id,
+          e."spentOn"                                                        AS txn_date,
+          ('EXP-' || UPPER(LEFT(e.id::text, 8)))                            AS voucher_no,
+          (e.category || COALESCE(': ' || e.subcategory, ''))               AS particulars,
+          COALESCE(e."vendorName", v.name, e.description)                   AS party,
+          NULL::text                                                         AS receipt_no,
+          e.amount::numeric                                                  AS debit,
+          0::numeric                                                         AS credit,
+          COALESCE(e."paymentSource", 'BANK')                               AS mode,
+          COALESCE(e.notes, e.description)                                   AS remarks,
+          'EXPENSE'                                                          AS source_module,
+          false                                                              AS is_reversed
+        FROM "Expense" e
+        LEFT JOIN "Vendor" v ON e."vendorId" = v.id
+        WHERE e."collegeId" = ${collegeId}
+          AND e."approvalStatus" = 'APPROVED'
+          AND e."spentOn" >= ${startDate}
+          AND e."spentOn" <= ${endDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft5
+            WHERE ft5."referenceNo" = e.id AND ft5.source = 'EXPENSE'
+          )
+
+        UNION ALL
+
+        -- Legacy Payroll (DEBIT) — only for paid payroll NOT yet in FinancialTransaction
+        SELECT
+          py.id::text                                                        AS id,
+          COALESCE(py."paidAt", NOW())                                       AS txn_date,
+          ('SAL-' || UPPER(LEFT(py.id::text, 8)))                           AS voucher_no,
+          ('Salary ' || py.month::text || '/' || py.year::text)             AS particulars,
+          s."fullName"                                                       AS party,
+          NULL::text                                                         AS receipt_no,
+          py."netAmount"::numeric                                            AS debit,
+          0::numeric                                                         AS credit,
+          'BANK_TRANSFER'                                                    AS mode,
+          ('Salary ' || py.month::text || '/' || py.year::text)             AS remarks,
+          'SALARY'                                                           AS source_module,
+          false                                                              AS is_reversed
+        FROM "Payroll" py
+        JOIN "Staff" s ON py."staffId" = s.id
+        WHERE s."collegeId" = ${collegeId}
+          AND py.status = 'PAID'
+          AND py."paidAt" >= ${startDate}
+          AND py."paidAt" <= ${endDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft6
+            WHERE ft6."referenceNo" = py.id AND ft6.source = 'SALARY'
+          )
+
+        UNION ALL
+
+        -- Legacy Payment Reversals (DEBIT) — only for reversals NOT yet in FinancialTransaction
+        SELECT
+          pr.id::text                                                        AS id,
+          pr."reversedAt"                                                    AS txn_date,
+          ('REV-' || UPPER(LEFT(pr.id::text, 8)))                           AS voucher_no,
+          'Payment Reversal'                                                 AS particulars,
+          COALESCE(s2."candidateName", 'Unknown')                           AS party,
+          p2."receiptNumber"                                                 AS receipt_no,
+          p2.amount::numeric                                                 AS debit,
+          0::numeric                                                         AS credit,
+          COALESCE(p2."paymentMode", 'CASH')                                AS mode,
+          pr.reason                                                          AS remarks,
+          'REVERSAL'                                                         AS source_module,
+          true                                                               AS is_reversed
+        FROM "PaymentReversal" pr
+        JOIN  "Payment" p2 ON pr."paymentId" = p2.id
+        LEFT JOIN "Student" s2 ON p2."studentId" = s2.id
+        WHERE p2."collegeId" = ${collegeId}
+          AND pr."reversedAt" >= ${startDate}
+          AND pr."reversedAt" <= ${endDate}
+          AND NOT EXISTS (
+            SELECT 1 FROM "FinancialTransaction" ft7
+            WHERE ft7."referenceNo" = p2.id AND ft7.source = 'REVERSAL'
+          )
+      )
+      SELECT
+        id,
+        txn_date,
+        voucher_no,
+        particulars,
+        party,
+        receipt_no,
+        debit::text,
+        credit::text,
+        mode,
+        remarks,
+        source_module,
+        is_reversed,
+        (${openingBalanceDecimal} + SUM(credit - debit) OVER (
+          ORDER BY txn_date, id
+          ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+        ))::text AS running_balance
+      FROM base
+      ORDER BY txn_date, id
+    `
+  );
+
+  const transactions: CashLedgerTransaction[] = rawTxns.map((t) => ({
+    id: t.id,
+    date: new Date(t.txn_date).toISOString().slice(0, 10),
+    voucher_no: t.voucher_no,
+    particulars: t.particulars,
+    party: t.party,
+    receipt_no: t.receipt_no,
+    debit: parseFloat(t.debit),
+    credit: parseFloat(t.credit),
+    mode: t.mode,
+    running_balance: parseFloat(t.running_balance),
+    remarks: t.remarks,
+    source_module: t.source_module,
+    is_reversed: t.is_reversed,
+  }));
+
+  const totalCredit = transactions.reduce((s, t) => s + t.credit, 0);
+  const totalDebit = transactions.reduce((s, t) => s + t.debit, 0);
+  const closingBalance = transactions.length > 0
+    ? transactions[transactions.length - 1].running_balance
+    : openingBalance;
+
+  return {
+    opening_balance: openingBalance,
+    transactions,
+    closing_balance: closingBalance,
+    total_credit: totalCredit,
+    total_debit: totalDebit,
+  };
+}
+
+// ─── Dashboard Summary ────────────────────────────────────────────────────────
 
 export async function buildDashboardSummary(prisma: PrismaClient, scope: ReportScope = {}) {
   const now = new Date();

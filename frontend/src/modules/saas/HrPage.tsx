@@ -13,9 +13,16 @@ import {
 import { toast } from "sonner";
 import { hasAnyPermission, hasPermission } from "../../lib/permissions";
 import { exportRowsToCsv, loadSavedPresets, removeSavedPreset, type SavedPreset, upsertSavedPreset } from "../../lib/viewPresets";
-import { api } from "../../services/api";
 import { AttendanceTrendChart } from "../../components/dashboard/AttendanceTrendChart";
 import { PayrollExceptionTrendChart } from "../../components/dashboard/PayrollExceptionTrendChart";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useCustomRoles } from "../../hooks/useAcademicStructure";
+import {
+  useStaff, useSalaryConfigs, useAttendance, useLeaveRequests, usePayroll,
+  useCreateStaff, useUpdateStaff, useDeleteStaff, useSetSalaryConfig,
+  useMarkAttendance, useUpdateLeaveStatus, useProcessPayroll, useUpdatePayrollStatus,
+} from "../../hooks/useHr";
 
 type College = { id: string; name: string };
 type Staff = { id: string; fullName: string; email: string; mobile: string; collegeId: string; role?: string; designation?: string; staffType?: string; employmentType?: string; joiningDate?: string; customRoleId?: string };
@@ -26,24 +33,6 @@ type SalaryConfig = { id: string; staffId: string; basicSalary: number; hra: num
 type SalaryConfigMap = Record<string, SalaryConfig>;
 type CustomRole = { id: string; collegeId: string; name: string; permissions: string[]; createdAt: string; updatedAt: string };
 
-type Props = {
-  colleges: College[];
-  staff: Staff[];
-  salaryConfigs: SalaryConfigMap;
-  customRoles: CustomRole[];
-  attendanceRows: Attendance[];
-  leaveRows: Leave[];
-  payrollRows: Payroll[];
-  loading: boolean;
-  permissions: string[];
-  onAddStaff: (payload: Record<string, unknown>) => Promise<void>;
-  onProcessPayroll: (payload: Record<string, unknown>) => Promise<void>;
-  onUpdateStaff: (staffId: string, payload: Record<string, unknown>) => Promise<void>;
-  onDeleteStaff: (staffId: string) => Promise<void>;
-  onUpdateLeaveStatus: (leaveRequestId: string, status: "APPROVED" | "REJECTED") => Promise<void>;
-  onSaveSalaryConfig: (staffId: string, config: Partial<SalaryConfig>) => Promise<void>;
-  onUpdatePayrollStatus: (payrollId: string, status: "PROCESSED" | "PAID" | "REVERSED") => Promise<void>;
-};
 
 type WorkspaceKey = "people" | "onboarding" | "payroll" | "attendance" | "leave";
 type StaffType = "TEACHING" | "EXECUTIVE";
@@ -181,24 +170,38 @@ function defaultOnboardingForm(colleges: College[]): OnboardingForm {
   };
 }
 
-export function HrPage({
-  colleges,
-  staff,
-  salaryConfigs,
-  customRoles,
-  attendanceRows,
-  leaveRows,
-  payrollRows,
-  loading,
-  permissions,
-  onAddStaff,
-  onProcessPayroll,
-  onUpdateStaff,
-  onDeleteStaff,
-  onUpdateLeaveStatus,
-  onSaveSalaryConfig,
-  onUpdatePayrollStatus,
-}: Props) {
+export function HrPage() {
+  const { permissions } = useAuth();
+  const { data: academicStructure = [] } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({ id: c.id, name: c.name }));
+  const { data: staff = [], isFetching: staffFetching } = useStaff();
+  const { data: salaryConfigs = {} } = useSalaryConfigs();
+  const { data: customRolesData = [] } = useCustomRoles();
+  const customRoles: CustomRole[] = customRolesData.map((r) => ({ id: r.id, collegeId: r.collegeId, name: r.name, permissions: r.permissions, createdAt: r.createdAt, updatedAt: r.updatedAt }));
+  const { data: attendanceData } = useAttendance();
+  const attendanceRows: Attendance[] = attendanceData?.data ?? [];
+  const { data: leaveData } = useLeaveRequests();
+  const leaveRows: Leave[] = leaveData?.data ?? [];
+  const { data: payrollRows = [] } = usePayroll();
+  const loading = staffFetching;
+
+  const createStaff = useCreateStaff();
+  const updateStaffMutation = useUpdateStaff();
+  const deleteStaffMutation = useDeleteStaff();
+  const setSalaryConfigMutation = useSetSalaryConfig();
+  const markAttendanceMutation = useMarkAttendance();
+  const updateLeaveStatusMutation = useUpdateLeaveStatus();
+  const processPayrollMutation = useProcessPayroll();
+  const updatePayrollStatusMutation = useUpdatePayrollStatus();
+
+  const onAddStaff = (payload: Record<string, unknown>) => createStaff.mutateAsync(payload).then(() => undefined);
+  const onProcessPayroll = (payload: Record<string, unknown>) => processPayrollMutation.mutateAsync(payload).then(() => undefined);
+  const onUpdateStaff = (staffId: string, payload: Record<string, unknown>) => updateStaffMutation.mutateAsync({ staffId, data: payload }).then(() => undefined);
+  const onDeleteStaff = (staffId: string) => deleteStaffMutation.mutateAsync(staffId).then(() => undefined);
+  const onUpdateLeaveStatus = (id: string, status: "APPROVED" | "REJECTED") => updateLeaveStatusMutation.mutateAsync({ id, status }).then(() => undefined);
+  const onSaveSalaryConfig = (staffId: string, config: Partial<SalaryConfig>) => setSalaryConfigMutation.mutateAsync({ staffId, data: config }).then(() => undefined);
+  const onUpdatePayrollStatus = (payrollId: string, status: "PROCESSED" | "PAID" | "REVERSED") => updatePayrollStatusMutation.mutateAsync({ payrollId, status }).then(() => undefined);
+
   const canManageStaff = hasPermission(permissions, "HR_WRITE");
   const canManageAttendance = hasPermission(permissions, "HR_ATTENDANCE");
   const canManageLeave = hasPermission(permissions, "HR_WRITE");
@@ -637,7 +640,7 @@ export function HrPage({
     event.preventDefault();
     setAttendanceLoading(true);
     try {
-      await api.post("/hr/attendance", {
+      await markAttendanceMutation.mutateAsync({
         staffId: attendanceStaffId,
         date: attendanceDate,
         status: attendanceStatus,

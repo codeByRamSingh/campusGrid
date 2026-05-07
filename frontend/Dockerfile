@@ -28,11 +28,18 @@ RUN printf 'server {\n\
     gzip on;\n\
     gzip_types text/plain text/css application/json application/javascript text/xml application/xml image/svg+xml;\n\
 \n\
+    # Never cache the HTML entry point so clients always get the latest asset hashes\n\
+    location = /index.html {\n\
+        add_header Cache-Control "no-cache, no-store, must-revalidate";\n\
+        add_header Pragma "no-cache";\n\
+        expires 0;\n\
+    }\n\
+\n\
     location / {\n\
         try_files $uri $uri/ /index.html;\n\
     }\n\
 \n\
-    # Cache static assets\n\
+    # Cache content-hashed assets forever\n\
     location ~* \\.(js|css|png|jpg|jpeg|gif|ico|svg|woff2?)$ {\n\
         expires 1y;\n\
         add_header Cache-Control "public, immutable";\n\

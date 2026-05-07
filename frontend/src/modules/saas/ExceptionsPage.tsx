@@ -1,47 +1,11 @@
 import { useMemo, useState } from "react";
 import { AlertOctagon, Clock3, RefreshCw, ShieldAlert, TrendingUp, Wrench } from "lucide-react";
 import { hasAnyPermission } from "../../lib/permissions";
+import { useAuth } from "../../contexts/AuthContext";
+import { useExceptions, useExceptionMetrics, useTransitionException, EXCEPTIONS_KEY, EXCEPTION_METRICS_KEY } from "../../hooks/useExceptions";
+import { exceptionsApi, type ExceptionStatus, type ExceptionSeverity, type ExceptionCase, type ExceptionMetrics } from "../../services/exceptionsApi";
+import { useQueryClient } from "@tanstack/react-query";
 
-type ExceptionStatus = "NEW" | "TRIAGED" | "ASSIGNED" | "IN_PROGRESS" | "RESOLVED" | "CLOSED" | "REOPENED";
-type ExceptionSeverity = "LOW" | "MEDIUM" | "HIGH" | "CRITICAL";
-
-type ExceptionCase = {
-  id: string;
-  collegeId: string;
-  module: string;
-  category: string;
-  severity: ExceptionSeverity;
-  title: string;
-  description: string;
-  status: ExceptionStatus;
-  assigneeStaffId?: string | null;
-  retryCount: number;
-  maxRetries: number;
-  createdAt: string;
-  slaDueAt?: string | null;
-  escalatedAt?: string | null;
-};
-
-type ExceptionMetrics = {
-  total: number;
-  resolved: number;
-  reopened: number;
-  resolutionRate: number;
-  mttrHours: number;
-  byStatus: Array<{ status: string; count: number }>;
-  bySeverity: Array<{ severity: string; count: number }>;
-  aging: Array<{ bucket: string; count: number }>;
-};
-
-type Props = {
-  exceptions: ExceptionCase[];
-  metrics: ExceptionMetrics | null;
-  loading: boolean;
-  permissions: string[];
-  onTransition: (exceptionCaseId: string, toStatus: ExceptionStatus, note?: string) => Promise<void>;
-  onRunAutomation: () => Promise<void>;
-  onRefresh: () => Promise<void>;
-};
 
 const statusFlow: ExceptionStatus[] = ["NEW", "TRIAGED", "ASSIGNED", "IN_PROGRESS", "RESOLVED", "CLOSED"];
 
@@ -67,7 +31,25 @@ function getNextStatus(status: ExceptionStatus): ExceptionStatus | null {
   return statusFlow[index + 1];
 }
 
-export function ExceptionsPage({ exceptions, metrics, loading, permissions, onTransition, onRunAutomation, onRefresh }: Props) {
+export function ExceptionsPage() {
+  const { permissions } = useAuth();
+  const qc = useQueryClient();
+  const { data: exceptions = [], isFetching: loading } = useExceptions();
+  const { data: metrics = null } = useExceptionMetrics();
+  const transitionMutation = useTransitionException();
+
+  const onTransition = (exceptionCaseId: string, toStatus: ExceptionStatus, note?: string) =>
+    transitionMutation.mutateAsync({ id: exceptionCaseId, data: { action: toStatus, notes: note } }).then(() => undefined);
+
+  const onRunAutomation = () => exceptionsApi.runAutomation().then(() => {
+    void qc.invalidateQueries({ queryKey: EXCEPTIONS_KEY });
+    void qc.invalidateQueries({ queryKey: EXCEPTION_METRICS_KEY });
+  });
+
+  const onRefresh = () => Promise.all([
+    qc.invalidateQueries({ queryKey: EXCEPTIONS_KEY }),
+    qc.invalidateQueries({ queryKey: EXCEPTION_METRICS_KEY }),
+  ]).then(() => undefined);
   const [query, setQuery] = useState("");
   const [statusFilter, setStatusFilter] = useState<ExceptionStatus | "ALL">("ALL");
   const [severityFilter, setSeverityFilter] = useState<ExceptionSeverity | "ALL">("ALL");

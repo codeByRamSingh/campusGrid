@@ -18,6 +18,11 @@ if (!fs.existsSync(PHOTO_STORAGE_DIR)) {
   fs.mkdirSync(PHOTO_STORAGE_DIR, { recursive: true });
 }
 
+const DOC_STORAGE_DIR = process.env.STORAGE_DIR ?? "/app/storage/documents";
+if (!fs.existsSync(DOC_STORAGE_DIR)) {
+  fs.mkdirSync(DOC_STORAGE_DIR, { recursive: true });
+}
+
 const photoStorage = multer.diskStorage({
   destination: (_req, _file, cb) => cb(null, PHOTO_STORAGE_DIR),
   filename: (_req, file, cb) => {
@@ -34,6 +39,33 @@ const photoUpload = multer({
       cb(null, true);
     } else {
       cb(new Error("Only JPEG, PNG, and WebP images are allowed for photos"));
+    }
+  },
+});
+
+const docStorage = multer.diskStorage({
+  destination: (_req, _file, cb) => cb(null, DOC_STORAGE_DIR),
+  filename: (_req, file, cb) => {
+    const ext = path.extname(file.originalname);
+    const safe = path.basename(file.originalname, ext).replace(/[^a-zA-Z0-9_-]/g, "_");
+    cb(null, `${Date.now()}_${safe}${ext}`);
+  },
+});
+
+const docUpload = multer({
+  storage: docStorage,
+  limits: { fileSize: 10 * 1024 * 1024 }, // 10 MB
+  fileFilter: (_req, file, cb) => {
+    const allowed = [
+      "image/jpeg", "image/png", "image/webp",
+      "application/pdf",
+      "application/msword",
+      "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    ];
+    if (allowed.includes(file.mimetype)) {
+      cb(null, true);
+    } else {
+      cb(new Error(`File type ${file.mimetype} is not allowed`));
     }
   },
 });
@@ -863,5 +895,162 @@ studentRouter.post(
     });
 
     res.json({ photoUrl: updated.photoUrl });
+  }
+);
+
+// GET /students/:studentId/documents — list uploaded documents for the student's latest admission
+studentRouter.get(
+  "/students/:studentId/documents",
+  requirePermission("STUDENTS_READ"),
+  async (req: AuthenticatedRequest, res) => {
+    const student = await prisma.student.findUnique({
+      where: { id: req.params.studentId },
+      include: {
+        admissions: {
+          orderBy: { createdAt: "desc" },
+          take: 1,
+          include: {
+            admissionDocuments: {
+              include: { document: true },
+              orderBy: { createdAt: "desc" },
+            },
+          },
+        },
+      },
+    });
+
+    if (!student) {
+      res.status(404).json({ message: "Student not found" });
+      return;
+    }
+    if (!canAccessCollege(req, student.collegeId)) {
+      res.status(403).json({ message: "Forbidden" });
+      return;
+    }
+
+    const admission = student.admissions[0];
+    const documents = (admission?.admissionDocuments ?? []).map((ad) => ({
+      id: ad.id,
+      documentId: ad.document.id,
+      docType: ad.docType,
+      fileName: ad.document.fileName,
+      mimeType: ad.document.mimeType,
+      sizeBytes: ad.document.sizeBytes,
+      uploadedAt: ad.createdAt,
+    }));
+
+    res.json({ documents, admissionId: admission?.id ?? null });
+  }
+);
+
+// POST /students/:studentId/documents — upload a document for the student's latest admission
+studentRouter.post(
+  "/students/:studentId/documents",
+  requirePermission("STUDENTS_WRITE"),
+  [param("studentId").notEmpty()],
+  handleValidation,
+  docUpload.single("document"),
+  async (req: AuthenticatedRequest, res) => {
+    if (!req.file) {
+      res.status(400).json({ message: "No file uploaded" });
+      return;
+    }
+
+    const student = await prisma.student.findUnique({
+      where: { id: req.params.studentId },
+      include: {
+        admissions: { orderBy: { createdAt: "desc" }, take: 1 },
+      },
+    });
+
+    if (!student) {
+      fs.unlink(req.file.path, () => {});
+      res.status(404).json({ message: "Student not found" });
+      return;
+    }
+    if (!canAccessCollege(req, student.collegeId)) {
+      fs.unlink(req.file.path, () => {});
+      res.status(403).json({ message: "Forbidden" });
+      return;
+    }
+
+    const admission = student.admissions[0];
+    if (!admission) {
+      fs.unlink(req.file.path, () => {});
+      res.status(400).json({ message: "Student has no admission record" });
+      return;
+    }
+
+    const docType = (req.body.docType as string | undefined) || req.file.originalname;
+
+    const doc = await prisma.document.create({
+      data: {
+        entityType: "ADMISSION",
+        entityId: admission.id,
+        collegeId: student.collegeId,
+        fileName: req.file.originalname,
+        storagePath: req.file.filename,
+        mimeType: req.file.mimetype,
+        sizeBytes: req.file.size,
+        uploadedBy: req.user?.id ?? null,
+      },
+    });
+
+    const admDoc = await prisma.admissionDocument.upsert({
+      where: { admissionId_docType: { admissionId: admission.id, docType } },
+      create: { admissionId: admission.id, documentId: doc.id, docType },
+      update: { documentId: doc.id },
+    });
+
+    res.status(201).json({
+      id: admDoc.id,
+      documentId: doc.id,
+      docType: admDoc.docType,
+      fileName: doc.fileName,
+      mimeType: doc.mimeType,
+      sizeBytes: doc.sizeBytes,
+      uploadedAt: admDoc.createdAt,
+    });
+  }
+);
+
+// DELETE /students/:studentId/documents/:admissionDocId — delete a student document
+studentRouter.delete(
+  "/students/:studentId/documents/:admissionDocId",
+  requirePermission("STUDENTS_WRITE"),
+  [param("studentId").notEmpty(), param("admissionDocId").notEmpty()],
+  handleValidation,
+  async (req: AuthenticatedRequest, res) => {
+    const admDoc = await prisma.admissionDocument.findUnique({
+      where: { id: req.params.admissionDocId },
+      include: {
+        admission: {
+          include: { student: { select: { id: true, collegeId: true } } },
+        },
+        document: true,
+      },
+    });
+
+    if (!admDoc) {
+      res.status(404).json({ message: "Document not found" });
+      return;
+    }
+    if (admDoc.admission.student.id !== req.params.studentId) {
+      res.status(403).json({ message: "Document does not belong to this student" });
+      return;
+    }
+    if (!canAccessCollege(req, admDoc.admission.student.collegeId)) {
+      res.status(403).json({ message: "Forbidden" });
+      return;
+    }
+
+    const filePath = path.join(DOC_STORAGE_DIR, admDoc.document.storagePath);
+    if (fs.existsSync(filePath)) {
+      fs.unlink(filePath, () => {});
+    }
+
+    await prisma.document.delete({ where: { id: admDoc.documentId } });
+
+    res.status(204).send();
   }
 );

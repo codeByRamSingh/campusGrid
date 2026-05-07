@@ -3,6 +3,9 @@ import { Building2, Plus, Users, Bed, Pencil, UserCheck } from "lucide-react";
 import { toast } from "sonner";
 import { api } from "../../services/api";
 import { hasPermission } from "../../lib/permissions";
+import { useAuth } from "../../contexts/AuthContext";
+import { useAcademicStructure } from "../../hooks/useAcademicStructure";
+import { useStudents } from "../../hooks/useStudents";
 
 type College = { id: string; name: string };
 
@@ -40,12 +43,6 @@ export type HostelAllocation = {
 
 type Student = { id: string; candidateName: string; admissionNumber: number };
 
-type Props = {
-  colleges: College[];
-  students: Student[];
-  permissions: string[];
-  loading: boolean;
-};
 
 const ROOM_TYPE_LABELS = { SINGLE: "Single", DOUBLE: "Double", TRIPLE: "Triple", DORMITORY: "Dormitory" };
 const STATUS_STYLES: Record<string, string> = {
@@ -54,7 +51,12 @@ const STATUS_STYLES: Record<string, string> = {
   RESERVED: "bg-amber-900/40 text-amber-300",
 };
 
-export default function HostelPage({ colleges, students, permissions, loading }: Props) {
+export default function HostelPage() {
+  const { permissions } = useAuth();
+  const { data: academicStructure = [], isFetching: loading } = useAcademicStructure();
+  const colleges: College[] = academicStructure.map((c) => ({ id: c.id, name: c.name }));
+  const { data: studentsPayload } = useStudents();
+  const students: Student[] = (Array.isArray(studentsPayload) ? studentsPayload : (studentsPayload?.data ?? [])).map((s) => ({ id: s.id, candidateName: s.candidateName, admissionNumber: s.admissionNumber }));
   const canWrite = hasPermission(permissions, "HOSTEL_WRITE");
 
   const [blocks, setBlocks] = useState<HostelBlock[]>([]);
