@@ -1,7 +1,7 @@
 import crypto from "crypto";
 import { promises as fs } from "fs";
 import path from "path";
-import { ExceptionModule, ExceptionSeverity } from "@prisma/client";
+import { ExceptionModule, ExceptionSeverity, FinancialTxnSource, FinancialTxnType } from "@prisma/client";
 import { BadRequestError, ConflictError, NotFoundError } from "../lib/errors.js";
 import { createExceptionCase } from "../lib/exceptions.js";
 import { writeAuditLog } from "../lib/audit.js";
@@ -9,6 +9,7 @@ import { sendNotification } from "../lib/notify.js";
 import { prisma } from "../lib/prisma.js";
 import { nextSequenceValue } from "../lib/sequence.js";
 import { buildLedgerSummary } from "./reporting.service.js";
+import { ledgerCredit, ledgerDebit } from "./ledger.service.js";
 import { FinanceRepository } from "../repositories/finance.repository.js";
 
 const financeRepo = new FinanceRepository(prisma);
@@ -251,7 +252,7 @@ export async function collectFee(input: CollectFeeInput, actorEmail?: string | n
   const payment = await prisma.$transaction(async (tx) => {
     const receiptNumber = await generateReceiptNumber(tx, student.collegeId, "FEE");
 
-    return financeRepo.createFeeCollectionTx(
+    const createdPayment = await financeRepo.createFeeCollectionTx(
       tx,
       {
         collegeId: student.collegeId,
@@ -326,6 +327,24 @@ export async function collectFee(input: CollectFeeInput, actorEmail?: string | n
         exceptionRequestId: approvedException?.id ?? null,
       },
     );
+
+    // Write to unified financial transaction ledger (single source of truth)
+    await tx.financialTransaction.create({
+      data: {
+        collegeId: student.collegeId,
+        voucherNo: receiptNumber,
+        type: FinancialTxnType.CREDIT,
+        amount,
+        mode: paymentMode ?? "CASH",
+        source: FinancialTxnSource.FEES,
+        studentId: input.studentId,
+        remarks: `${cycleLabel ?? "Fee"} — ${student.candidateName}`,
+        date: paidAt,
+        createdBy: actorUserId ?? null,
+      },
+    });
+
+    return createdPayment;
   });
 
   return payment;
@@ -597,15 +616,6 @@ export async function createMiscCredit(input: CreateMiscCreditInput, actorUserId
   return prisma.$transaction(async (tx) => {
     const receiptNumber = await generateReceiptNumber(tx, input.collegeId, "MISC");
 
-    const createdCredit = await tx.credit.create({
-      data: {
-        collegeId: input.collegeId,
-        amount: input.amount,
-        source: input.source,
-        notes: input.notes ?? null,
-      },
-    });
-
     await tx.payment.create({
       data: {
         collegeId: input.collegeId,
@@ -616,12 +626,26 @@ export async function createMiscCredit(input: CreateMiscCreditInput, actorUserId
       },
     });
 
+    // Write to unified financial transaction ledger (single source of truth)
+    const ftx = await tx.financialTransaction.create({
+      data: {
+        collegeId: input.collegeId,
+        voucherNo: receiptNumber,
+        type: FinancialTxnType.CREDIT,
+        amount: input.amount,
+        mode: "BANK",
+        source: FinancialTxnSource.MISC,
+        remarks: input.notes ?? input.source,
+        createdBy: actorUserId ?? null,
+      },
+    });
+
     await tx.auditLog.create({
       data: {
         actorUserId,
         action: "MISC_CREDIT_ADDED",
-        entityType: "CREDIT",
-        entityId: createdCredit.id,
+        entityType: "FINANCIAL_TRANSACTION",
+        entityId: ftx.id,
         metadata: {
           collegeId: input.collegeId,
           amount: input.amount,
@@ -631,7 +655,7 @@ export async function createMiscCredit(input: CreateMiscCreditInput, actorUserId
       },
     });
 
-    return createdCredit;
+    return ftx;
   });
 }
 
@@ -658,6 +682,19 @@ export async function createFine(input: CreateFineInput, actorUserId?: string) {
         description: input.description,
         receiptNumber,
       },
+    });
+
+    // Phase 2: ledger CREDIT for fine collection
+    await ledgerCredit(tx, {
+      collegeId: student.collegeId,
+      voucherNo: receiptNumber,
+      amount: input.amount,
+      mode: "CASH",
+      source: FinancialTxnSource.FEES,
+      studentId: input.studentId,
+      referenceNo: createdFine.id,
+      remarks: `Fine — ${input.description}`,
+      createdBy: actorUserId ?? null,
     });
 
     await tx.studentTimeline.create({
@@ -702,6 +739,19 @@ export async function reversePayment(paymentId: string, reason: string, actorUse
         reason,
         reversedBy: actorUserId ?? null,
       },
+    });
+
+    // Phase 4: ledger REVERSAL debit — referenceNo = payment.id for deduplication
+    // in buildCashLedger so the legacy PaymentReversal block is skipped for this record.
+    await ledgerDebit(tx, {
+      collegeId: payment.collegeId,
+      voucherNo: `REV-${payment.receiptNumber}`,
+      amount: Number(payment.amount),
+      mode: payment.paymentMode ?? "CASH",
+      source: FinancialTxnSource.REVERSAL,
+      referenceNo: payment.id,
+      remarks: reason,
+      createdBy: actorUserId ?? null,
     });
 
     await tx.auditLog.create({
@@ -857,6 +907,22 @@ export async function postFeeCollectionFromDraft(draftId: string, actorEmail?: s
           cycleKey,
           receiptNumber,
         },
+      },
+    });
+
+    // Write to unified financial transaction ledger (single source of truth)
+    await tx.financialTransaction.create({
+      data: {
+        collegeId: student.collegeId,
+        voucherNo: receiptNumber,
+        type: FinancialTxnType.CREDIT,
+        amount,
+        mode: paymentMode ?? "CASH",
+        source: FinancialTxnSource.FEES,
+        studentId: student.id,
+        remarks: `${cycleLabel ?? "Fee"} — ${student.candidateName}`,
+        date: paidAt,
+        createdBy: actorUserId ?? null,
       },
     });
 
@@ -1047,23 +1113,43 @@ export async function approveExpense(expenseId: string, actorUserId?: string) {
     throw err;
   }
 
-  const updated = await financeRepo.updateExpense(expenseId, {
-    approvalStatus: "APPROVED",
-    approvedByUserId: actorUserId ?? null,
-    approvedAt: new Date(),
-    rejectedAt: null,
-    rejectionNote: null,
-  });
+  // Phase 2: wrap approval + ledger debit atomically so a ledger failure rolls
+  // back the approval status change.
+  return prisma.$transaction(async (tx) => {
+    const updated = await tx.expense.update({
+      where: { id: expenseId },
+      data: {
+        approvalStatus: "APPROVED",
+        approvedByUserId: actorUserId ?? null,
+        approvedAt: new Date(),
+        rejectedAt: null,
+        rejectionNote: null,
+      },
+    });
 
-  await writeAuditLog(prisma, {
-    actorUserId,
-    action: "EXPENSE_APPROVED",
-    entityType: "EXPENSE",
-    entityId: expense.id,
-    metadata: { collegeId: expense.collegeId, amount: String(expense.amount) },
-  });
+    // Ledger DEBIT — referenceNo links back to the Expense row for deduplication.
+    await ledgerDebit(tx, {
+      collegeId: expense.collegeId,
+      voucherNo: `EXP-${expense.id.slice(0, 8).toUpperCase()}`,
+      amount: Number(expense.amount),
+      mode: expense.paymentSource ?? "BANK",
+      source: FinancialTxnSource.EXPENSE,
+      referenceNo: expense.id,
+      remarks: `${expense.category}${expense.subcategory ? ": " + expense.subcategory : ""}`,
+      date: expense.spentOn,
+      createdBy: actorUserId ?? null,
+    });
 
-  return updated;
+    await writeAuditLog(tx as typeof prisma, {
+      actorUserId,
+      action: "EXPENSE_APPROVED",
+      entityType: "EXPENSE",
+      entityId: expense.id,
+      metadata: { collegeId: expense.collegeId, amount: String(expense.amount) },
+    });
+
+    return updated;
+  });
 }
 
 export async function rejectExpense(expenseId: string, note: string | null, actorUserId?: string) {
@@ -1187,27 +1273,44 @@ export async function createVendorPayment(input: CreateVendorPaymentInput, actor
   const vendor = await financeRepo.findVendorCollegeId(input.vendorId);
   if (!vendor) throw new NotFoundError("Vendor not found");
 
-  const payment = await financeRepo.createVendorPayment({
-    vendorId: input.vendorId,
-    collegeId: vendor.collegeId,
-    amount: Number(input.amount),
-    description: input.description,
-    paymentMode: optionalString(input.paymentMode) ?? "BANK_TRANSFER",
-    referenceNumber: optionalString(input.referenceNumber),
-    expenseId: optionalString(input.expenseId),
-    paidAt: input.paidAt ? new Date(input.paidAt) : new Date(),
-    recordedBy: actorUserId ?? null,
-  });
+  return prisma.$transaction(async (tx) => {
+    const payment = await tx.vendorPayment.create({
+      data: {
+        vendorId: input.vendorId,
+        collegeId: vendor.collegeId,
+        amount: Number(input.amount),
+        description: input.description,
+        paymentMode: optionalString(input.paymentMode) ?? "BANK_TRANSFER",
+        referenceNumber: optionalString(input.referenceNumber),
+        expenseId: optionalString(input.expenseId),
+        paidAt: input.paidAt ? new Date(input.paidAt) : new Date(),
+        recordedBy: actorUserId ?? null,
+      },
+    });
 
-  await writeAuditLog(prisma, {
-    actorUserId,
-    action: "VENDOR_PAYMENT_RECORDED",
-    entityType: "VENDOR_PAYMENT",
-    entityId: payment.id,
-    metadata: { vendorId: input.vendorId, amount: payment.amount },
-  });
+    // Phase 2: ledger DEBIT for vendor payment (EXPENSE source)
+    await ledgerDebit(tx, {
+      collegeId: vendor.collegeId,
+      voucherNo: `VP-${payment.id.slice(0, 8).toUpperCase()}`,
+      amount: Number(input.amount),
+      mode: optionalString(input.paymentMode) ?? "BANK_TRANSFER",
+      source: FinancialTxnSource.EXPENSE,
+      referenceNo: payment.id,
+      remarks: input.description,
+      date: input.paidAt ? new Date(input.paidAt) : new Date(),
+      createdBy: actorUserId ?? null,
+    });
 
-  return payment;
+    await writeAuditLog(tx as typeof prisma, {
+      actorUserId,
+      action: "VENDOR_PAYMENT_RECORDED",
+      entityType: "VENDOR_PAYMENT",
+      entityId: payment.id,
+      metadata: { vendorId: input.vendorId, amount: payment.amount },
+    });
+
+    return payment;
+  });
 }
 
 // ─── Budgets ──────────────────────────────────────────────────────────────────
@@ -1310,7 +1413,63 @@ export async function deleteRecurringExpense(id: string) {
   return item;
 }
 
-// ─── Petty Cash ───────────────────────────────────────────────────────────────
+/**
+ * Materialise a recurring-expense template as a PENDING Expense record so it
+ * flows through the normal Approvals queue. When approved, the Phase 2
+ * approveExpense() handler writes the FinancialTransaction (EXPENSE debit)
+ * to the unified cash ledger automatically.
+ *
+ * Also advances nextDueDate by one frequency period.
+ */
+export async function postRecurringExpense(id: string, actorUserId?: string) {
+  const item = await financeRepo.findRecurringExpenseById(id);
+  if (!item) throw new NotFoundError("Recurring expense not found");
+
+  // Compute next occurrence date
+  const current = new Date(item.nextDueDate);
+  let next: Date;
+  switch (item.frequency) {
+    case "WEEKLY":   next = new Date(current); next.setDate(next.getDate() + 7); break;
+    case "MONTHLY":  next = new Date(current); next.setMonth(next.getMonth() + 1); break;
+    case "QUARTERLY":next = new Date(current); next.setMonth(next.getMonth() + 3); break;
+    case "ANNUAL":   next = new Date(current); next.setFullYear(next.getFullYear() + 1); break;
+    default:         next = new Date(current); next.setMonth(next.getMonth() + 1);
+  }
+
+  return prisma.$transaction(async (tx) => {
+    // Create the PENDING expense
+    const expense = await tx.expense.create({
+      data: {
+        collegeId: item.collegeId,
+        category: item.category,
+        subcategory: item.subcategory ?? null,
+        amount: item.amount,
+        spentOn: new Date(item.nextDueDate),
+        notes: `Auto-generated from recurring: ${item.title}`,
+        approvalStatus: "PENDING",
+        vendorId: item.vendorId ?? null,
+      },
+    });
+
+    // Advance the recurring schedule
+    await tx.recurringExpense.update({
+      where: { id: item.id },
+      data: { nextDueDate: next },
+    });
+
+    await writeAuditLog(tx as typeof prisma, {
+      actorUserId,
+      action: "RECURRING_EXPENSE_POSTED",
+      entityType: "EXPENSE",
+      entityId: expense.id,
+      metadata: { recurringId: id, collegeId: item.collegeId, amount: String(item.amount) },
+    });
+
+    return expense;
+  });
+}
+
+
 
 export async function listPettyCash(collegeId?: string) {
   return financeRepo.listPettyCash(collegeId);
@@ -1349,7 +1508,7 @@ export async function createPettyCashEntry(input: CreatePettyCashInput, actorUse
         throw new BadRequestError("Insufficient petty cash balance");
       }
 
-      return tx.pettyCashEntry.create({
+      const entry = await tx.pettyCashEntry.create({
         data: {
           collegeId: input.collegeId,
           entryType: input.entryType,
@@ -1360,6 +1519,32 @@ export async function createPettyCashEntry(input: CreatePettyCashInput, actorUse
           recordedBy: actorUserId ?? null,
         },
       });
+
+      // Derive transaction type: ALLOCATION/REIMBURSEMENT = CREDIT, EXPENSE = DEBIT
+      const txnType =
+        input.entryType === "ALLOCATION" || input.entryType === "REIMBURSEMENT"
+          ? FinancialTxnType.CREDIT
+          : FinancialTxnType.DEBIT;
+
+      const voucherPrefix = input.entryType === "ALLOCATION" ? "PC-ALLOC" :
+        input.entryType === "REIMBURSEMENT" ? "PC-REIMB" : "PC-EXP";
+      const voucherNo = `${voucherPrefix}-${entry.id.slice(0, 8).toUpperCase()}`;
+
+      await tx.financialTransaction.create({
+        data: {
+          collegeId: input.collegeId,
+          voucherNo,
+          type: txnType,
+          amount,
+          mode: "CASH",
+          source: FinancialTxnSource.PETTY_CASH,
+          referenceNo: optionalString(input.reference),
+          remarks: input.description,
+          createdBy: actorUserId ?? null,
+        },
+      });
+
+      return entry;
     },
     { isolationLevel: "Serializable" },
   );
@@ -1898,6 +2083,22 @@ export async function collectFeeAllocated(
           receiptNumber,
           paymentMode,
         } as object,
+      },
+    });
+
+    // Write to unified financial transaction ledger (single source of truth)
+    await tx.financialTransaction.create({
+      data: {
+        collegeId: student.collegeId,
+        voucherNo: receiptNumber,
+        type: FinancialTxnType.CREDIT,
+        amount: totalAmount,
+        mode: paymentMode,
+        source: FinancialTxnSource.FEES,
+        studentId: input.studentId,
+        remarks: description,
+        date: paidAt,
+        createdBy: actorUserId ?? null,
       },
     });
 

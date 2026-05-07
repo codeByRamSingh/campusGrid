@@ -216,3 +216,35 @@ budgetsRouter.delete(
     }
   },
 );
+
+// ─── POST /finance/recurring-expenses/:id/post ────────────────────────────────
+// Materialises a recurring expense template as a PENDING Expense record so it
+// can be reviewed in the Approvals queue and — once approved — writes to the
+// unified cash ledger.
+
+budgetsRouter.post(
+  "/finance/recurring-expenses/:id/post",
+  requirePermission("FINANCE_WRITE"),
+  async (req: AuthenticatedRequest, res, next) => {
+    try {
+      const item = await FinanceService.getRecurringExpenseForCollegeCheck(req.params.id);
+      if (!item) {
+        res.status(404).json({ message: "Recurring expense not found" });
+        return;
+      }
+      if (!canAccessCollege(req, item.collegeId)) {
+        res.status(403).json({ message: "Forbidden" });
+        return;
+      }
+
+      const expense = await FinanceService.postRecurringExpense(req.params.id, req.user?.id);
+      res.status(201).json(expense);
+    } catch (err) {
+      if (err instanceof AppError) {
+        res.status(err.status).json({ message: err.message });
+        return;
+      }
+      next(err);
+    }
+  },
+);

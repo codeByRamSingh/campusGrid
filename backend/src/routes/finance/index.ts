@@ -7,6 +7,7 @@ import { vendorsRouter } from "./vendors.routes.js";
 import { budgetsRouter } from "./budgets.routes.js";
 import { pettyCashRouter } from "./petty-cash.routes.js";
 import { ledgerRouter } from "./ledger.routes.js";
+import { transactionsRouter } from "./transactions.routes.js";
 
 export const financeRouter = Router();
 
@@ -31,3 +32,4 @@ financeRouter.use(vendorsRouter);
 financeRouter.use(budgetsRouter);
 financeRouter.use(pettyCashRouter);
 financeRouter.use(ledgerRouter);
+financeRouter.use(transactionsRouter);

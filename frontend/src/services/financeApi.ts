@@ -10,6 +10,51 @@ export type Ledger = {
   period?: string;
 };
 
+export type CashLedgerTransaction = {
+  id: string;
+  date: string;
+  voucher_no: string;
+  particulars: string;
+  party: string | null;
+  receipt_no: string | null;
+  debit: number;
+  credit: number;
+  mode: string;
+  running_balance: number;
+  remarks: string | null;
+  source_module: string;
+  is_reversed: boolean;
+};
+
+export type CashLedgerResponse = {
+  opening_balance: number;
+  transactions: CashLedgerTransaction[];
+  closing_balance: number;
+  total_credit: number;
+  total_debit: number;
+};
+
+export type FinancialTxnType = "CREDIT" | "DEBIT";
+export type FinancialTxnSource = "FEES" | "MISC" | "EXPENSE" | "PETTY_CASH" | "SALARY" | "ADJUSTMENT" | "REVERSAL";
+
+export type FinancialTransaction = {
+  id: string;
+  collegeId: string;
+  date: string;
+  voucherNo: string;
+  type: FinancialTxnType;
+  amount: number;
+  mode: string;
+  source: FinancialTxnSource;
+  studentId: string | null;
+  referenceNo: string | null;
+  remarks: string | null;
+  isReversed: boolean;
+  reversalOf: string | null;
+  createdAt: string;
+  createdBy: string | null;
+};
+
 export const financeApi = {
   // ─── Fee Collection ──────────────────────────────────────────────────────────
   collectFee: (data: Record<string, unknown>) =>
@@ -63,6 +108,19 @@ export const financeApi = {
   getCredits: (collegeId?: string) =>
     api.get("/finance/misc-credits", { params: collegeId ? { collegeId } : {} }).then((r) => r.data),
 
+  // ─── Financial Transactions (unified ledger) ──────────────────────────────────
+  getTransactions: (params: {
+    collegeId?: string;
+    source?: FinancialTxnSource;
+    start_date?: string;
+    end_date?: string;
+    limit?: number;
+  }) =>
+    api.get<FinancialTransaction[]>("/finance/transactions", { params }).then((r) => r.data),
+
+  reverseTransaction: (id: string, reason?: string) =>
+    api.post<FinancialTransaction>(`/finance/transactions/${id}/reverse`, { reason }).then((r) => r.data),
+
   // ─── Budgets ─────────────────────────────────────────────────────────────────
   getBudgets: (collegeId?: string) =>
     api.get("/finance/budgets", { params: collegeId ? { collegeId } : {} }).then((r) => r.data),
@@ -98,6 +156,31 @@ export const financeApi = {
   // ─── Ledger ──────────────────────────────────────────────────────────────────
   getLedger: (params?: { collegeId?: string; period?: string }) =>
     api.get<Ledger>("/finance/ledger", { params }).then((r) => r.data),
+
+  // ─── Ledger Balance (authoritative, from FinancialTransaction) ───────────────
+  getLedgerBalance: (collegeId: string) =>
+    api.get<{ collegeId: string; balance: number; source: string }>(
+      "/finance/ledger-balance", { params: { collegeId } }
+    ).then((r) => r.data),
+
+  // ─── Consistency Check ───────────────────────────────────────────────────────
+  getConsistencyCheck: (collegeId: string) =>
+    api.get<{
+      collegeId: string;
+      status: "CLEAN" | "DRIFT_DETECTED";
+      missingExpenseLedger: number;
+      missingPayrollLedger: number;
+      missingFeeCollectionLedger: number;
+      missingPaymentReversalLedger: number;
+      ledgerBalance: number;
+      moduleBalance: number;
+      drift: number;
+      recommendation: string;
+    }>("/finance/consistency-check", { params: { collegeId } }).then((r) => r.data),
+
+  // ─── Cash Ledger ─────────────────────────────────────────────────────────────
+  getCashLedger: (params: { college_id: string; start_date?: string; end_date?: string }) =>
+    api.get<CashLedgerResponse>("/finance/cash-ledger", { params }).then((r) => r.data),
 
   // ─── Student Ledger ──────────────────────────────────────────────────────────
   getStudentLedger: (studentId: string) =>

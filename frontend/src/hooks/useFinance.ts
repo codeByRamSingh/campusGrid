@@ -1,6 +1,7 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { financeApi } from "../services/financeApi";
 import { useAuth } from "../contexts/AuthContext";
+import { CASH_LEDGER_KEY } from "./useFinanceLedger";
 
 export const EXPENSES_KEY = ["expenses"] as const;
 export const VENDORS_KEY = ["vendors"] as const;
@@ -76,7 +77,10 @@ export function useCollectFee() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: financeApi.collectFee,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["students"] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["students"] });
+      void qc.invalidateQueries({ queryKey: CASH_LEDGER_KEY });
+    },
   });
 }
 
@@ -88,7 +92,10 @@ export function useConfirmFeeDraft() {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: financeApi.confirmFeeDraft,
-    onSuccess: () => qc.invalidateQueries({ queryKey: ["students"] }),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: ["students"] });
+      void qc.invalidateQueries({ queryKey: CASH_LEDGER_KEY });
+    },
   });
 }
 

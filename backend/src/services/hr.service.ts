@@ -7,6 +7,7 @@ import { buildInviteLink, generateOpaqueToken, hashOpaqueToken } from "../lib/se
 import { sendInAppNotification, sendNotification } from "../lib/notify.js";
 import { prisma } from "../lib/prisma.js";
 import { HrRepository } from "../repositories/hr.repository.js";
+import { ledgerDebit } from "./ledger.service.js";
 
 const hrRepo = new HrRepository(prisma);
 
@@ -540,6 +541,40 @@ export async function processPayroll(input: ProcessPayrollInput, actorUserId?: s
 export async function updatePayrollStatus(payrollId: string, status: string, actorUserId?: string) {
   const existing = await hrRepo.findPayrollById(payrollId);
   if (!existing) throw new NotFoundError("Payroll record not found");
+
+  // Phase 2: when marking payroll as PAID, atomically write a SALARY ledger debit.
+  if (status === "PAID" && existing.status !== "PAID") {
+    const updated = await prisma.$transaction(async (tx) => {
+      const result = await tx.payroll.update({
+        where: { id: payrollId },
+        data: { status: "PAID", paidAt: new Date() },
+      });
+
+      await ledgerDebit(tx, {
+        collegeId: existing.staff.collegeId,
+        voucherNo: `SAL-${existing.id.slice(0, 8).toUpperCase()}`,
+        amount: Number(existing.netAmount),
+        mode: "BANK_TRANSFER",
+        source: "SALARY",
+        referenceNo: existing.id,
+        remarks: `Salary ${existing.month}/${existing.year}`,
+        date: new Date(),
+        createdBy: actorUserId ?? null,
+      });
+
+      await writeAuditLog(tx as typeof prisma, {
+        actorUserId,
+        action: "PAYROLL_STATUS_UPDATED",
+        entityType: "PAYROLL",
+        entityId: result.id,
+        metadata: { status: result.status, staffId: result.staffId, month: result.month, year: result.year },
+      });
+
+      return result;
+    });
+
+    return updated;
+  }
 
   const updated = await hrRepo.updatePayrollStatus(payrollId, status);
 
